@@ -80,32 +80,32 @@ int main() {
     /* The tooltip, by priority: the question, then a receive, then a send,
        then the state. What the user can act on comes before what the device
        is doing. */
-    CHECK(tooltip(DH_HELPER_CONNECTED, "", 0, 0, false) == "DeskHopPlus — Connected and paired",
+    CHECK(tooltip(DH_HELPER_CONNECTED, "", 0, 0, false) == "DeskHopPlus — 已连接并配对",
           "an idle tooltip names the helper and the state");
-    CHECK(tooltip(DH_HELPER_QUIET, "", 0, 0, false) == "DeskHopPlus — Looking for the device",
+    CHECK(tooltip(DH_HELPER_QUIET, "", 0, 0, false) == "DeskHopPlus — 寻找设备",
           "the quiet state now has an icon, so it has words to hover");
     CHECK(tooltip(DH_HELPER_CONNECTED, "", 2200000, 8388608, false)
-              == "DeskHopPlus — Receiving 2.0 MB of 8.0 MB — 26%",
+              == "DeskHopPlus — 接收中... 2.0 MB — 26%",
           "a receive shows the percent, truncated, the same as the Mac");
-    CHECK(tooltip(DH_HELPER_CONNECTED, "", 0, 0, true) == "DeskHopPlus — Sending",
+    CHECK(tooltip(DH_HELPER_CONNECTED, "", 0, 0, true) == "DeskHopPlus — 发送中",
           "a send is named, since the icon does not change for it");
     CHECK(tooltip(DH_HELPER_CONNECTED, "", 4096, 8192, true)
-              == "DeskHopPlus — Receiving 4 KB of 8 KB — 50%",
+              == "DeskHopPlus — 接收中... 4 KB — 50%",
           "a receive outranks a send: it has a number");
     CHECK(tooltip(DH_HELPER_CONNECTED, "photo.jpg — 1.0 MB, about 5 seconds.", 4096, 8192, true)
-              == "DeskHopPlus — Files offered: photo.jpg — 1.0 MB, about 5 seconds.",
+              == "DeskHopPlus — 提供的文件: photo.jpg — 1.0 MB, about 5 seconds.",
           "a waiting question outranks everything");
     /* The other computer's helper, only while this one has a session (#275). */
-    CHECK(peer_row(DH_HELPER_CONNECTED, true) == "Other computer connected", "a connected peer is said");
-    CHECK(peer_row(DH_HELPER_LISTENER_DETECTED, false) == "Other computer not connected",
+    CHECK(peer_row(DH_HELPER_CONNECTED, true) == "已连接对方计算机", "a connected peer is said");
+    CHECK(peer_row(DH_HELPER_LISTENER_DETECTED, false) == "未连接对方计算机",
           "a missing peer is said on any live session");
     CHECK(peer_row(DH_HELPER_DEVICE_ABSENT, true).empty(), "without a session there is no peer status");
     CHECK(peer_row(DH_HELPER_CONNECTED, std::nullopt).empty(), "a session not yet told says nothing");
-    CHECK(tooltip(DH_HELPER_CONNECTED, "", 0, 0, false, "Other computer connected")
-              == "DeskHopPlus — Connected and paired\nOther computer connected",
+    CHECK(tooltip(DH_HELPER_CONNECTED, "", 0, 0, false, "已连接对方计算机")
+              == "DeskHopPlus — 已连接并配对\n已连接对方计算机",
           "the tooltip carries the peer status on its own line");
     CHECK(tooltip(DH_HELPER_NOT_PAIRED, "", 0, 0, false)
-              == "DeskHopPlus — Not paired — press the Pair chord (Left Ctrl + Right Shift + P)",
+              == "DeskHopPlus — 未配对 — 按快捷键配对 (Left Ctrl + Right Shift + P)",
           "a state with a remedy keeps its remedy");
 
     /* The size spelling the Mac and Windows quote one transfer at. */

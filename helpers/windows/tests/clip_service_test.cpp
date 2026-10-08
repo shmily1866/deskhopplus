@@ -1242,7 +1242,7 @@ void test_an_over_cap_copy_is_explained_where_the_paste_would_be() {
 
     /* And now they cross, find nothing pastes, and are told why. */
     pair.settle(pair.b.user_is_here(), Side::B);
-    CHECK(pair.saw_note("larger than the 1 MB clipboard limit"),
+    CHECK(pair.saw_note("剪切板限制"),
           "arriving did not explain why nothing pasted");
 
     /* Once, not on every crossing. */
