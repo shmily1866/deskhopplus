@@ -1,0 +1,187 @@
+{# templates/main.j2 #}
+
+{# The helper's own mark: two rounded screens joined by a short bar — the
+   solid "paired" look. A hand copy of the one geometry, which lives in the
+   macOS menu bar's drawing code (`MenuBar.image(for:)` in
+   helpers/macos/Sources/deskhop-helper/MenuBar.swift), the same source the
+   icon renderer packs every shipped icon from (#208). Change it there first.
+   The 16-unit grid and y-runs-down match, so the numbers copy across. #}
+{% macro glyph_rects() %}<rect x="1" y="4" width="6" height="8" rx="1"/><rect x="9" y="4" width="6" height="8" rx="1"/><rect x="7" y="7.25" width="2" height="1.5"/>{% endmacro %}
+
+{# The tab icon. A tab icon never sees the page's colours, so it carries its
+   own dark-mode rule and stays legible on a dark tab strip. Written as a data
+   URI: the packed page is one file, so it cannot link a second one.
+
+   The two fills repeat the `ink` and dark `ink` values from style.css as
+   literals. A second document cannot read this one's custom properties, so
+   there is no way to point at the tokens; change a token and change these too.
+
+   The fills are written `%23…` because a raw `#` would cut the URI short here
+   and nowhere else; the markup's own `<`, `>` and `"` are encoded at the point
+   of use below. Jinja's `urlencode` is not used: it would escape the whole
+   string, spaces and slashes and all, for no gain. #}
+{%- set favicon_svg %}<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><style>svg{fill:%231d1d1f}@media(prefers-color-scheme:dark){svg{fill:%23f2f2f7}}</style>{{ glyph_rects() }}</svg>{% endset %}
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <style>
+    {% include "style.css" %}
+  </style>
+
+  <link rel="icon" href="data:image/svg+xml,{{ favicon_svg | replace('<', '%3C') | replace('>', '%3E') | replace('"', "'") }}">
+  <title>DeskHopPlus</title>
+</head>
+
+<body>
+
+{# Every section's markup is always in the document: the field query paths,
+   Read and the Save loop see every field whether its section is shown or not.
+   The sidebar only decides which one is visible. #}
+{% set sections = [('desk', 'Desk'), ('keyboard', 'Keyboard & Mouse'), ('hotkeys', 'Hotkeys'),
+                   ('clipboard', 'Clipboard'), ('status', 'Status'), ('service', 'Service')] %}
+
+{# Field lists are flat, with label items as headings. A label starts a new
+   grouped box with the label as its title, the way the OS groups its rows;
+   fields before the first label form an untitled box. #}
+{% macro grouped(fields) %}
+  {% set ns = namespace(open=False) %}
+  {% for item in fields %}
+    {% if item.elem == 'label' %}
+      {% if ns.open %}</div>{% endif %}
+      <h3 class="sub">{{ item.name }}</h3>
+      <div class="group">{% set ns.open = True %}
+    {% else %}
+      {% if not ns.open %}<div class="group">{% set ns.open = True %}{% endif %}
+      {% include "form.html" with context %}
+    {% endif %}
+  {% endfor %}
+  {% if ns.open %}</div>{% endif %}
+{% endmacro %}
+
+{# The common config list's groups a section owns, in their order. #}
+{% macro common(groups, headings=True) %}
+  {% set ns = namespace(group='', items=[]) %}
+  {% for item in config %}
+    {% if item.elem == 'label' %}{% set ns.group = item.name %}{% endif %}
+    {% if ns.group in groups and (headings or item.elem != 'label') %}
+      {% set ns.items = ns.items + [item] %}
+    {% endif %}
+  {% endfor %}
+  {{ grouped(ns.items) }}
+{% endmacro %}
+
+{# The strips' mark: an exclamation in a ring, drawn once. #}
+{% macro alert_glyph() %}<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 4.5v4.2M8 11.6v.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>{% endmacro %}
+
+<div class="window">
+  <nav class="sidebar" id="sidebar" aria-label="Sections">
+    <h1><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">{{ glyph_rects() }}</svg>DeskHopPlus</h1>
+    {% for id, name in sections %}
+    <button type="button" data-section="{{ id }}"{% if loop.first %} aria-current="page"{% endif %}>{{ name }}</button>
+    {% endfor %}
+  </nav>
+
+  <div class="pane">
+    <header class="toolbar">
+      <p id="connection" aria-live="polite">Not connected</p>
+      <div id="menu-buttons">
+        <button type="button" data-handler="connectHandler">Connect</button>
+        <button type="button" data-handler="readHandler" class="online" disabled>Read</button>
+        <button type="button" data-handler="saveHandler" class="online primary" disabled>Save<span id="unsaved" hidden></span></button>
+        <button type="button" data-handler="rebootHandler" class="online" disabled>Exit</button>
+      </div>
+    </header>
+
+    <div id="warning" class="strip" role="alert" hidden>{{ alert_glyph() }}<div>
+      <strong>This browser has no WebHID.</strong> Open this page in Chrome or another
+      Chromium browser to connect to the board.
+    </div></div>
+    <div id="refusal" class="strip" role="alert" hidden>{{ alert_glyph() }}<div></div></div>
+
+    <main id="main">
+      <fieldset id="fields" disabled>
+      <section data-section="desk" aria-labelledby="desk-title">
+        <h2 id="desk-title">Desk</h2>
+        <div class="well">
+          <div id="layout" data-selected="A">Connect to see your monitor layout.</div>
+          <p id="layout-status" aria-live="polite"></p>
+        </div>
+        <p class="hint">Drag a label to move a computer; drag Main onto its last numbered monitor to flip it.
+          The snapped drop is checked while you drag. Click a computer to see its settings below.
+          Along-seam offsets are stored in the Segment Start and End values under Advanced.</p>
+        <p class="hint">Save, then try the layout while this page stays connected. Wait for the helper
+          to say “Connected and paired — config mode” for correct multi-monitor hops. If it says
+          “Device in config mode”, Exit before testing multi-monitor hops. Config mode reboots on
+          entry and Exit, and ends automatically after five minutes. On a Mac, eject the DESKHOP
+          drive in Finder before Exit or the timeout: macOS can hang its disk mounter when a
+          mounted drive vanishes.</p>
+
+        {% for letter, fields in [('A', screen_A), ('B', screen_B)] %}
+        <div class="computer" data-computer="{{ letter }}"{% if not loop.first %} hidden{% endif %}>
+          <h3>Output {{ letter }}<span data-os-of="{{ letter }}"></span></h3>
+          {{ grouped(fields | rejectattr('advanced') | list) }}
+        </div>
+        {% endfor %}
+
+        <details id="advanced">
+          <summary>Advanced</summary>
+          {% for letter, fields in [('A', screen_A), ('B', screen_B)] %}
+          <div class="computer" data-computer="{{ letter }}" id="advanced-{{ letter }}"{% if not loop.first %} hidden{% endif %}>
+            {{ grouped(fields | selectattr('advanced') | list) }}
+          </div>
+          {% endfor %}
+        </details>
+      </section>
+
+      <section data-section="keyboard" aria-labelledby="keyboard-title" hidden>
+        <h2 id="keyboard-title">Keyboard &amp; Mouse</h2>
+        {{ common(['Mouse', 'Keyboard', 'Status LED']) }}
+        <p class="hint">Any key or mouse move turns it back on. Config mode always blinks.</p>
+      </section>
+
+      <section data-section="hotkeys" aria-labelledby="hotkeys-title" hidden>
+        <h2 id="hotkeys-title">Hotkeys</h2>
+        <p class="hint">Key names joined with +, for example lctrl+rshift+c+o.</p>
+        {{ common(['Hotkeys'], headings=False) }}
+      </section>
+
+      <section data-section="clipboard" aria-labelledby="clipboard-title" hidden>
+        <h2 id="clipboard-title">Clipboard</h2>
+        {{ common(['Clipboard'], headings=False) }}
+      </section>
+
+      <section data-section="status" aria-labelledby="status-title" hidden>
+        <h2 id="status-title">Status</h2>
+        {{ grouped(status) }}
+        <h3>Cursor transition trace</h3>
+        <div class="group">
+          <div class="row"><button type="button" class="online" onclick="readCursorTraceHandler()">Read trace</button></div>
+          <pre id="cursorTrace">No trace read.</pre>
+        </div>
+      </section>
+
+      <section data-section="service" aria-labelledby="service-title" hidden>
+        <h2 id="service-title">Service</h2>
+        <div class="group" id="service-buttons">
+          <div class="row"><span>Blink this board's LED</span><button type="button" class="online" data-handler="blinkHandler">Blink</button></div>
+          <div class="row"><span>Blink both boards' LEDs</span><button type="button" class="online" data-handler="blinkBothHandler">Blink both</button></div>
+          <div class="row"><span>Reboot into the bootloader for a firmware upgrade</span><button type="button" class="online" data-handler="enterBootloaderHandler" data-arm="Click again to reboot">Bootloader</button></div>
+          <div class="row"><span>Erase every setting and the helper pairing</span><button type="button" class="online" data-handler="wipeConfigHandler" data-arm="Click again to wipe">Wipe Config</button></div>
+        </div>
+      </section>
+      </fieldset>
+    </main>
+  </div>
+</div>
+
+  <script>
+  {% include "script.js" %}
+  </script>
+</body>
+
+</html>

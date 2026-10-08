@@ -1,0 +1,141 @@
+/*
+ * This file is part of DeskHop (https://github.com/hrvach/deskhop).
+ * Copyright (c) 2025 Hrvoje Cavrak
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * See the file LICENSE for the full license text.
+ * Modified by Derek Reynolds, 2026, for deskhopplus.
+ */
+
+#include "main.h"
+
+#ifdef DH_BENCH_UART
+#include "bench_uart.h"
+#endif
+
+/* ================================================== *
+ * ===============  Sending Packets  ================ *
+ * ================================================== */
+
+/* Takes a packet as uart_packet_t struct, adds preamble, checksum and encodes it to a raw array. */
+void write_raw_packet(uint8_t *dst, uart_packet_t *packet) {
+    uint8_t pkt[RAW_PACKET_LENGTH] = {[0] = START1,
+                                      [1] = START2,
+                                      [2] = packet->type,
+                                      /* [3-10] is data, defaults to 0 */
+                                      [11] = calc_checksum(packet->data, PACKET_DATA_LENGTH)};
+
+    memcpy(&pkt[START_LENGTH + TYPE_LENGTH], packet->data, PACKET_DATA_LENGTH);
+    memcpy(dst, &pkt, RAW_PACKET_LENGTH);
+}
+
+/* The one entry to the transmit queue: returns false when the queue was full
+   and the packet dropped, counting every drop in uart_tx_stats. The log is
+   held to power-of-two counts so a congested link isn't stalled by logging. */
+bool queue_uart_packet(uart_packet_t *packet, device_t *state) {
+    bool queued = dh_txq_track(&state->uart_tx_stats,
+                               queue_try_add(&state->uart_tx_queue, packet));
+    uint32_t dropped = state->uart_tx_stats.dropped;
+    if (!queued && (dropped & (dropped - 1)) == 0)
+        dh_debug_printf("uart_tx_queue full, dropped type 0x%02x (%lu total)\r\n",
+                        packet->type, (unsigned long)dropped);
+    return queued;
+}
+
+/* Schedule packet for sending to the other box */
+bool queue_packet(const uint8_t *data, enum packet_type_e packet_type, int length) {
+    uart_packet_t packet = {.type = packet_type};
+    memcpy(packet.data, data, length);
+
+    return queue_uart_packet(&packet, &global_state);
+}
+
+/* Sends just one byte of a certain packet type to the other box. */
+bool send_value(const uint8_t value, enum packet_type_e packet_type) {
+    return queue_packet(&value, packet_type, sizeof(uint8_t));
+}
+
+/* Process outgoing config report messages. */
+void process_uart_tx_task(device_t *state) {
+    uart_packet_t packet = {0};
+
+    if (dma_channel_is_busy(state->dma_tx_channel))
+        return;
+
+    if (!queue_try_remove(&state->uart_tx_queue, &packet))
+        return;
+
+    write_raw_packet(uart_txbuf, &packet);
+    dma_channel_transfer_from_buffer_now(state->dma_tx_channel, uart_txbuf, RAW_PACKET_LENGTH);
+}
+
+/* ================================================== *
+ * ===============  Parsing Packets  ================ *
+ * ================================================== */
+
+const uart_handler_t uart_handler[] = {
+    /* Core functions */
+    {.type = KEYBOARD_REPORT_MSG, .handler = handle_keyboard_uart_msg},
+    {.type = SYNTHESIZED_KEYBOARD_REPORT_MSG, .handler = handle_keyboard_uart_msg},
+    {.type = MOUSE_REPORT_MSG, .handler = handle_mouse_abs_uart_msg},
+    {.type = OUTPUT_SELECT_MSG, .handler = handle_output_select_msg},
+    {.type = CURSOR_PLACE_MSG, .handler = handle_cursor_place_msg},
+    {.type = CURSOR_POSITION_MSG, .handler = handle_cursor_position_msg},
+    {.type = CURSOR_QUERY_MSG, .handler = handle_cursor_query_msg},
+    {.type = CURSOR_QUERY_UNAVAILABLE_MSG, .handler = handle_cursor_query_unavailable_msg},
+
+    /* Box control */
+    {.type = MOUSE_ZOOM_MSG, .handler = handle_mouse_zoom_msg},
+    {.type = BOOT_MOUSE_MODE_MSG, .handler = handle_boot_mouse_mode_msg},
+    {.type = KBD_SET_REPORT_MSG, .handler = handle_set_report_msg},
+    {.type = SWITCH_LOCK_MSG, .handler = handle_switch_lock_msg},
+    {.type = SYNC_BORDERS_MSG, .handler = handle_sync_borders_msg},
+    {.type = FLASH_LED_MSG, .handler = handle_flash_led_msg},
+    {.type = GAMING_MODE_MSG, .handler = handle_toggle_gaming_msg},
+    {.type = CONSUMER_CONTROL_MSG, .handler = handle_consumer_control_msg},
+    {.type = SYSTEM_CONTROL_MSG, .handler = handle_system_control_msg},
+    {.type = SCREENSAVER_MSG, .handler = handle_screensaver_msg},
+
+    /* Config */
+    {.type = WIPE_CONFIG_MSG, .handler = handle_wipe_config_msg},
+    {.type = PAIR_WINDOW_MSG, .handler = handle_pair_window_msg},
+    {.type = SAVE_CONFIG_MSG, .handler = handle_save_config_msg},
+    {.type = REBOOT_MSG, .handler = handle_reboot_msg},
+    {.type = GET_VAL_MSG, .handler = handle_api_msgs},
+    {.type = GET_ALL_VALS_MSG, .handler = handle_api_read_all_msg},
+    {.type = SET_VAL_MSG, .handler = handle_api_msgs},
+    {.type = GET_CURSOR_TRACE_MSG, .handler = handle_cursor_trace_msg},
+
+    /* Firmware */
+    {.type = REQUEST_BYTE_MSG, .handler = handle_request_byte_msg},
+    {.type = RESPONSE_BYTE_MSG, .handler = handle_response_byte_msg},
+    {.type = FIRMWARE_UPGRADE_MSG, .handler = handle_fw_upgrade_msg},
+
+    /* Helper channel relay (#47) - carried opaquely, never parsed */
+    {.type = CHANNEL_START_MSG, .handler = handle_channel_relay_msg},
+    {.type = CHANNEL_DATA_MSG, .handler = handle_channel_relay_msg},
+
+    {.type = HEARTBEAT_MSG, .handler = handle_heartbeat_msg},
+    {.type = PROXY_PACKET_MSG, .handler = handle_proxy_msg},
+
+#ifdef DH_BENCH_UART
+    /* Measure-only build (#166): the peer board's flood, counted where every other
+       packet is dispatched so the receive path under test is the real one. */
+    {.type = BENCH_UART_MSG, .handler = bench_uart_rx_msg},
+#endif
+};
+
+void process_packet(uart_packet_t *packet, device_t *state) {
+    if (!verify_checksum(packet))
+        return;
+
+    for (int i = 0; i < ARRAY_SIZE(uart_handler); i++) {
+        if (uart_handler[i].type == packet->type) {
+            uart_handler[i].handler(packet, state);
+            return;
+        }
+    }
+}

@@ -1,0 +1,200 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
+/* Copyright (c) 2026 Derek Reynolds */
+
+#include "output_dispatch.h"
+
+#include "dh_bundle.h"
+#include "words.h"
+
+namespace deskhop {
+
+/* Charge ADR-0004's idle timer only for a frame the transport took (#107).
+   Session frames are already built; all payloads use the same builder below. */
+bool OutputDispatch::send_frame(const std::vector<uint8_t> &frame, const std::string &name) {
+    if (effects_.send(frame)) {
+        effects_.note_sent();
+        return true;
+    }
+    effects_.note_send_refused();
+    effects_.log(name + " was not taken by the transport and is lost");
+    return false;
+}
+
+bool OutputDispatch::send_payload(uint8_t type, const std::vector<uint8_t> &body,
+                                  const std::string &name, const std::string &refusal_suffix) {
+    std::vector<uint8_t> frame;
+    if (!effects_.build_frame(type, body, frame)) {
+        effects_.log(name + " could not be built; there is no session");
+        return false;
+    }
+    return send_frame(frame, name + refusal_suffix);
+}
+
+bool OutputDispatch::peer_status(uint8_t type, const uint8_t *body, size_t len) {
+    if (type != DH_MSG_PEER_HELPER) return false;
+    if (len != 1) {
+        effects_.log("a PEER_HELPER of " + std::to_string(len) + " bytes, not 1, was ignored");
+        return true;
+    }
+    effects_.log(body[0] ? "other computer connected" : "other computer not connected");
+    effects_.show_peer(body[0] != 0);
+    return true;
+}
+
+void OutputDispatch::apply(const Output &output) {
+    /* No `default:`, deliberately, in this switch and the one below. An output
+       kind added to a service and forgotten here is then a compile error
+       rather than a silent fall-through — /W4 /WX on MSVC and -Werror=switch
+       elsewhere — and the census in the test says the same thing again. */
+    switch (output.kind) {
+    case Output::Kind::StoreBoardKey:
+        if (!effects_.store_board_key(output.bytes))
+            effects_.log("paired, but the board key could not be stored — pairing will not "
+                         "survive a restart");
+        /* The key comes once per grant, so this is once per registration (#268). */
+        effects_.tell_news("Paired");
+        break;
+
+    case Output::Kind::OpenChannels:
+        effects_.acquire_channels();
+        break;
+
+    case Output::Kind::CloseChannels:
+        effects_.release_channels();
+        break;
+
+    case Output::Kind::Send:
+        send_frame(output.bytes, "a session frame");
+        break;
+
+    case Output::Kind::State:
+        if (!words::state_is_known(output.state))
+            effects_.log("the core reported state " +
+                         std::to_string(static_cast<int>(output.state)) +
+                         ", which this helper has no words for");
+        effects_.log("state: " + (words::state_message(output.state).empty()
+                                      ? std::string("(nothing to report)")
+                                      : words::state_message(output.state)));
+        effects_.show_state(output.state);
+        break;
+
+    case Output::Kind::ClipPolicy:
+        emit(effects_.clip_policy_changed(output.clip_flags, output.clip_cap_mb));
+        break;
+
+    case Output::Kind::Retry:
+        /* The deadline is the run loop's to hold: the clock is 32-bit
+           milliseconds and wraps, so it is compared there as an unsigned
+           difference rather than as `now >= then`. */
+        effects_.schedule_retry(output.retry_after_ms);
+        break;
+
+    case Output::Kind::Note:
+        effects_.log(output.note);
+        break;
+    }
+}
+
+void OutputDispatch::apply(const std::vector<Output> &outputs) {
+    for (const Output &output : outputs) apply(output);
+}
+
+/*
+ * The clipboard's outputs: frames to authenticate and send, payloads to write,
+ * and diagnostics.
+ *
+ * Every frame goes out through `build_frame` — HelperSession::emit — never
+ * with a counter of this layer's own, because the counter space belongs to the
+ * session key and the heartbeat is already writing into it. `note_sent` is
+ * what keeps ADR-0004's beat out of a direction that is far from idle.
+ */
+void OutputDispatch::emit(const ClipOutput &output) {
+    switch (output.kind) {
+    case ClipOutput::Kind::Send:
+        send_payload(output.type, output.bytes, "a clipboard frame",
+                     " of type " + std::to_string(output.type));
+        break;
+
+    case ClipOutput::Kind::Deliver:
+        if (output.payload_kind == static_cast<uint8_t>(ClipKind::Text)) {
+            effects_.deliver_text(output.bytes);
+        } else if (output.payload_kind == static_cast<uint8_t>(ClipKind::Png)) {
+            effects_.deliver_image(output.bytes);
+        } else if (output.payload_kind == static_cast<uint8_t>(ClipKind::Bundle)) {
+            deliver_bundle(output.bytes);
+        } else {
+            effects_.log("a payload of kind " + std::to_string(output.payload_kind) +
+                         " arrived, which this helper does not write");
+        }
+        break;
+
+    case ClipOutput::Kind::LazyImage:
+        effects_.lazy_image(output.transfer_id, output.total);
+        break;
+
+    case ClipOutput::Kind::CancelLazyImage:
+        effects_.cancel_lazy_image(output.transfer_id);
+        break;
+
+    case ClipOutput::Kind::FileOffer:
+        effects_.ask_about_files(
+            deskhop::FileOffer{output.transfer_id, output.total, output.files});
+        break;
+
+    case ClipOutput::Kind::FileOfferWithdrawn:
+        effects_.withdraw_file_question(output.transfer_id);
+        break;
+
+    case ClipOutput::Kind::DeliverFiles:
+        effects_.deliver_files(FileDelivery{output.files, output.bytes});
+        break;
+
+    case ClipOutput::Kind::Note:
+        effects_.log(output.note);
+        break;
+
+    case ClipOutput::Kind::TellUser:
+        /* Logged as well as shown: the log is the record, the balloon is the
+           part a person actually reads. */
+        effects_.log(output.note);
+        effects_.tell_user(output.note);
+        break;
+
+    case ClipOutput::Kind::ProtocolError:
+        effects_.log("clipboard protocol error: " + output.note + "; dropping the connection");
+        effects_.release_channels();
+        break;
+    }
+}
+
+/*
+ * A bundle (#195) is unpacked here, where a test can watch, and written in
+ * *one* clipboard write: `deliver_text` then `deliver_image` would bump the
+ * sequence twice and the second would clear the first. The first non-empty
+ * part of each kind is the one taken, as on macOS. A bundle with one usable
+ * part — the far end sent a
+ * kind this helper does not write beside it — takes the single-format path,
+ * which is the one already proven on hardware.
+ */
+void OutputDispatch::deliver_bundle(const std::vector<uint8_t> &payload) {
+    dh_bundle bundle;
+    if (!dh_bundle_unpack(payload.data(), payload.size(), &bundle)) {
+        effects_.log("a bundle arrived that could not be unpacked; nothing was written");
+        return;
+    }
+    std::vector<uint8_t> text, png;
+    for (uint8_t i = 0; i < bundle.count; i++) {
+        const dh_bundle_part &part = bundle.parts[i];
+        std::vector<uint8_t> &into = part.kind == DH_BUNDLE_PART_TEXT ? text : png;
+        if (into.empty()) into.assign(part.bytes, part.bytes + part.len);
+    }
+    if (!text.empty() && !png.empty()) effects_.deliver_bundle(text, png);
+    else if (!text.empty()) effects_.deliver_text(text);
+    else effects_.deliver_image(png);
+}
+
+void OutputDispatch::emit(const std::vector<ClipOutput> &outputs) {
+    for (const ClipOutput &output : outputs) emit(output);
+}
+
+} // namespace deskhop

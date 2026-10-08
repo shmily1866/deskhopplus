@@ -1,0 +1,119 @@
+/*
+ * This file is part of DeskHop (https://github.com/hrvach/deskhop).
+ * Copyright (c) 2025 Hrvoje Cavrak
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * See the file LICENSE for the full license text.
+ * Modified by Derek Reynolds, 2026, for deskhopplus.
+ */
+
+#include "main.h"
+#include "core/dh_status_led.h"
+
+/* ==================================================== *
+ * ========== Update pico and keyboard LEDs  ========== *
+ * ==================================================== */
+
+void set_keyboard_leds(uint8_t requested_led_state, device_t *state) {
+    static uint8_t new_led_value;
+
+    new_led_value = requested_led_state;
+    if (state->keyboard_connected) {
+        if(tuh_hid_set_report(state->kbd_dev_addr,
+                              state->kbd_instance,
+                              0,
+                              HID_REPORT_TYPE_OUTPUT,
+                              &new_led_value,
+                              sizeof(uint8_t)))
+
+            state->keyboard_leds_actual[BOARD_ROLE] = requested_led_state;
+    }
+}
+
+/* The on-board Status LED only: lit when this board is the active output and
+   the Status LED is not set to go dark (#283). */
+static void restore_status_led(device_t *state) {
+    state->onboard_led_state = (state->active_output == BOARD_ROLE) && !state->led_dark;
+    gpio_put(GPIO_LED_PIN, state->onboard_led_state);
+}
+
+void restore_leds(device_t *state) {
+    restore_status_led(state);
+
+    /* Light up appropriate keyboard leds (if it's connected locally) */
+    if (state->keyboard_connected) {
+        uint8_t leds = state->keyboard_leds_desired[state->active_output];
+        set_keyboard_leds(leds, state);
+    }
+}
+
+uint8_t toggle_led(void) {
+    uint8_t new_led_state = gpio_get(GPIO_LED_PIN) ^ 1;
+    gpio_put(GPIO_LED_PIN, new_led_state);
+
+    return new_led_state;
+}
+
+void blink_led(device_t *state) {
+    /* Since LEDs might be ON previously, we go OFF, ON, OFF, ON, OFF */
+    state->blinks_left     = 5;
+    state->last_led_change = time_us_32();
+}
+
+void led_sync_task(device_t *state) {
+    /* Check if keyboard LEDs need to be updated */
+    if (state->keyboard_connected) {
+        uint8_t desired_leds = state->keyboard_leds_desired[state->active_output];
+
+        if (state->keyboard_leds_actual[BOARD_ROLE] != desired_leds)
+            set_keyboard_leds(desired_leds, state);
+    }
+}
+
+/* Decides whether the Status LED goes dark (#283). Mid-blink it leaves the pin
+   alone: led_blinking_task ends in restore_leds, which picks the flag up. The
+   keyboard LEDs are not touched. */
+void status_led_task(device_t *state) {
+    bool dark = dh_status_led_dark(state->config.led_off_mode, state->config.led_off_sec,
+                                   time_us_64(), state->last_activity[BOARD_ROLE],
+                                   state->last_switch_time, state->config_mode_active);
+    if (dark == state->led_dark)
+        return;
+
+    state->led_dark = dark;
+    if (state->blinks_left == 0)
+        restore_status_led(state);
+}
+
+void led_blinking_task(device_t *state) {
+    const int blink_interval_us = 80000; /* 80 ms off, 80 ms on */
+    static uint8_t leds;
+
+    /* If there is no more blinking to be done, exit immediately */
+    if (state->blinks_left == 0)
+        return;
+
+    /* We have some blinks left to do, check if they are due, exit if not */
+    if ((time_us_32()) - state->last_led_change < blink_interval_us)
+        return;
+
+    /* Toggle the LED state */
+    uint8_t new_led_state = toggle_led();
+
+    /* Also keyboard leds (if it's connected locally) since on-board leds are not visible */
+    leds = new_led_state * 0x07; /* Numlock, capslock, scrollock */
+
+    if (state->keyboard_connected)
+        set_keyboard_leds(leds, state);
+
+    /* Decrement the counter and update the last-changed timestamp */
+    state->blinks_left--;
+    state->last_led_change = time_us_32();
+
+    /* Restore LEDs in the last pass */
+    if (state->blinks_left == 0)
+        restore_leds(state);
+}

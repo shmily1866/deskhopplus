@@ -1,0 +1,277 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (c) 2026 Derek Reynolds
+
+import DHCore
+import Foundation
+
+/*
+ * What each output *does* — the shim's two switches, with the platform behind
+ * a protocol (#152).
+ *
+ * Both services below it are covered in depth: `HelperSession` binds the
+ * shared C core, `ClipboardService` joins the seal to the transfer, and both
+ * have their own suites. The layer that turns each of their outputs into a
+ * real effect had none, so every arm was correct by reading only — a service
+ * could be proved to emit the right output while the shim dropped it, called
+ * the wrong thing, or fell through. That is the shape of #93 and #94: a helper
+ * that reports healthy while doing nothing.
+ *
+ * No IOKit and no AppKit here, which is why this file lives in DeskhopChannel
+ * rather than beside HelperRuntime. The transport, the pasteboard and the
+ * Keychain stay in the executable target behind `HelperEffects`, and this file
+ * only decides which of them an output reaches.
+ *
+ * The Windows twin is output_dispatch.h/.cpp, and the two are deliberately the
+ * same shape — a divergence between them is a clipboard that works on one
+ * computer and not the other. One arm is not the same, and by decision: the
+ * State arm there checks that the wording knows the state (#119) and drives a
+ * tray. The same check happens here one layer up — `HelperSession.convert`
+ * turns a state `HelperState` has no case for into a `.note` before it becomes
+ * an output — so by the time a `.state` arrives it is already worded; and this
+ * helper has no tray.
+ *
+ * Single-threaded by construction, like the rest of the helper.
+ */
+
+/*
+ * Every effect an output can have, named once.
+ *
+ * HelperRuntime implements each of these in a line or two over the real object
+ * — the IOKit transport, the pasteboard, the Keychain — and a test implements
+ * them by writing down what it was asked to do.
+ */
+public protocol HelperEffects: AnyObject {
+    /// The Keychain. False when the key could not be written.
+    func storeBoardKey(_ key: [UInt8]) -> Bool
+
+    /* The transport. `send` is false when it would not take the frame, which
+       is a different reading from a quiet link (#107, #132). */
+    func acquireChannels()
+    func releaseChannels()
+    func send(_ frame: [UInt8]) -> Bool
+
+    /* The session. The counter space belongs to the session key, so a frame is
+       built there and never here. */
+    func buildFrame(type: UInt8, body: [UInt8]) -> [UInt8]?
+    func noteSent()
+    func noteSendRefused()
+
+    /*
+     * The menu bar. Its Windows twin has had this since #85; macOS had nowhere
+     * to put a state until #56 gave it one, so the state output was logged and
+     * nothing else. Logged *as well*, because the log is still where a fault is
+     * read back from afterwards.
+     */
+    func show(state: HelperState)
+
+    /// This computer's pasteboard.
+    func deliver(text: [UInt8])
+    func deliver(image: [UInt8])
+    /// Both parts of a bundle (#195), in one pasteboard write. Neither is
+    /// empty: a bundle with one usable part takes the single-format path above.
+    func deliver(bundle text: [UInt8], png: [UInt8])
+    func lazyImage(id: UInt32, total: UInt64)
+    func cancelLazyImage(id: UInt32)
+    /* Files (#56). `askAboutFiles` puts the acceptance to the user: nothing has
+       crossed the link yet, and nothing will until the user answers. */
+    func askAboutFiles(_ offer: FileOffer)
+    func withdrawFileQuestion(id: UInt32)
+    func deliver(files: FileDelivery)
+
+    /// The run loop's retry timer, and the conditions it re-checks when it fires.
+    func scheduleRetry(after: TimeInterval)
+
+    /* The clipboard service. The board is the single source of truth for the
+       policy and the size cap, so a direction turning off — or a cap moving —
+       has to reach the service that honours it (#52, #56). */
+    func clipPolicyChanged(flags: UInt8, capMegabytes: UInt8) -> [ClipboardOutput]
+
+    func note(_ message: String)
+
+    /// Put a message in front of the user. Something they did produced
+    /// nothing, and only they can act on why.
+    func tellUser(_ message: String)
+
+    /// Put good news in front of the user, once: shown like `tellUser` but
+    /// not as a complaint ("Paired", #268).
+    func tellNews(_ message: String)
+
+    /// Whether the other computer's helper is connected now (#275).
+    func show(peerConnected: Bool)
+}
+
+public final class OutputDispatch {
+    /// Unowned: HelperRuntime owns this object, not the other way round, and a
+    /// strong reference back would be a cycle. `effects` must outlive it.
+    private unowned let effects: HelperEffects
+
+    public init(effects: HelperEffects) { self.effects = effects }
+
+    // Charge ADR-0004's idle timer only for a frame the transport took (#107).
+    @discardableResult
+    private func sendFrame(_ frame: [UInt8], name: String) -> Bool {
+        if effects.send(frame) {
+            effects.noteSent()
+            return true
+        }
+        effects.noteSendRefused()
+        effects.note(name + " was not taken by the transport and is lost")
+        return false
+    }
+
+    /// Cursor and clipboard payloads share the session's builder and send
+    /// accounting. Only clipboard refusals add a message type to the name.
+    @discardableResult
+    public func sendPayload(type: UInt8, body: [UInt8], name: String,
+                            refusalSuffix: String = "") -> Bool {
+        guard let frame = effects.buildFrame(type: type, body: body) else {
+            effects.note(name + " could not be built; there is no session")
+            return false
+        }
+        return sendFrame(frame, name: name + refusalSuffix)
+    }
+
+    /// PEER_HELPER: whether the other computer's helper is connected now
+    /// (#275). True when `type` was one, malformed or not.
+    public func peerStatus(type: UInt8, body: [UInt8]) -> Bool {
+        guard type == UInt8(DH_MSG_PEER_HELPER.rawValue) else { return false }
+        guard body.count == 1 else {
+            effects.note("a PEER_HELPER of \(body.count) bytes, not 1, was ignored")
+            return true
+        }
+        effects.note("other computer " + (body[0] != 0 ? "connected" : "not connected"))
+        effects.show(peerConnected: body[0] != 0)
+        return true
+    }
+
+    /* Logged as well as shown, like a clipboard `.tellUser`. */
+    private func news(_ message: String) {
+        effects.note(message)
+        effects.tellNews(message)
+    }
+
+    /* Neither switch below has a `default:`, deliberately. An output case added
+       to a service and forgotten here is then a compile error rather than a
+       silent fall-through, so `swift run channel-tests` fails rather than
+       passing over a shim that does nothing. */
+    public func apply(_ outputs: [SessionOutput]) {
+        for output in outputs { apply(output) }
+    }
+
+    public func apply(_ output: SessionOutput) {
+        switch output {
+        case .storeBoardKey(let key):
+            if !effects.storeBoardKey(key) {
+                effects.note("paired, but the board key could not be stored — pairing "
+                             + "will not survive a restart")
+            }
+            /* The key comes once per grant, so this is once per registration (#268). */
+            news("Paired")
+
+        case .openChannels:
+            effects.acquireChannels()
+
+        case .closeChannels:
+            effects.releaseChannels()
+
+        case .send(let bytes):
+            sendFrame(bytes, name: "a session frame")
+
+        case .state(let state):
+            effects.note("state: \(state.message ?? "(nothing to report)")")
+            effects.show(state: state)
+
+        case .clipPolicy(let flags, let capMegabytes):
+            emit(effects.clipPolicyChanged(flags: flags, capMegabytes: capMegabytes))
+
+        case .retry(let after):
+            effects.scheduleRetry(after: after)
+
+        case .note(let note):
+            effects.note(note)
+        }
+    }
+
+    /*
+     * The clipboard's outputs: frames to authenticate and send, payloads to
+     * write, and diagnostics.
+     *
+     * Every frame goes out through `buildFrame` — HelperSession.emit — never
+     * with a counter of this layer's own, because the counter space belongs to
+     * the session key and the heartbeat is already writing into it. `noteSent`
+     * is what keeps ADR-0004's beat out of a direction that is far from idle.
+     */
+    public func emit(_ outputs: [ClipboardOutput]) {
+        for output in outputs { emit(output) }
+    }
+
+    public func emit(_ output: ClipboardOutput) {
+        switch output {
+        case .send(let type, let body):
+            sendPayload(type: type, body: body, name: "a clipboard frame",
+                        refusalSuffix: " of type \(type)")
+
+        case .deliver(let kind, let bytes):
+            if kind == ClipKind.text.rawValue {
+                effects.deliver(text: bytes)
+            } else if kind == ClipKind.png.rawValue {
+                effects.deliver(image: bytes)
+            } else if kind == ClipKind.bundle.rawValue {
+                deliver(bundle: bytes)
+            } else {
+                effects.note("a payload of kind \(kind) arrived, which this helper does not "
+                             + "write")
+            }
+
+        case .lazyImage(let id, let total):
+            effects.lazyImage(id: id, total: total)
+        case .cancelLazyImage(let id):
+            effects.cancelLazyImage(id: id)
+
+        case .tellUser(let message):
+            /* Logged as well as shown: the log is the record, the message is
+               the part a person actually reads. */
+            effects.note(message)
+            effects.tellUser(message)
+
+        case .fileOffer(let offer):
+            effects.askAboutFiles(offer)
+        case .fileOfferWithdrawn(let id):
+            effects.withdrawFileQuestion(id: id)
+        case .deliverFiles(let delivery):
+            effects.deliver(files: delivery)
+
+        case .note(let note):
+            effects.note(note)
+
+        case .protocolError(let note):
+            effects.note("clipboard protocol error: \(note); dropping the connection")
+            effects.releaseChannels()
+        }
+    }
+
+    /*
+     * A bundle (#195) is unpacked here, where a test can watch, and written in
+     * *one* pasteboard write: `deliver(text:)` then `deliver(image:)` would
+     * bump the change count twice and the second would clear the first. The
+     * first non-empty part of each kind is the one taken, as on Windows. A
+     * bundle with one usable part
+     * — the far end sent a kind this helper does not write beside it — takes
+     * the single-format path, which is the one already proven on hardware.
+     */
+    private func deliver(bundle payload: [UInt8]) {
+        guard let parts = ClipBundle.unpack(payload) else {
+            effects.note("a bundle arrived that could not be unpacked; nothing was written")
+            return
+        }
+        let text = parts.first { $0.kind == ClipKind.text.rawValue && !$0.bytes.isEmpty }?.bytes ?? []
+        let png = parts.first { $0.kind == ClipKind.png.rawValue && !$0.bytes.isEmpty }?.bytes ?? []
+        if !text.isEmpty && !png.isEmpty {
+            effects.deliver(bundle: text, png: png)
+        } else if !text.isEmpty {
+            effects.deliver(text: text)
+        } else {
+            effects.deliver(image: png)
+        }
+    }
+}

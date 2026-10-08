@@ -1,0 +1,333 @@
+# Modified by Derek Reynolds, 2026, for deskhopplus.
+cmake_minimum_required(VERSION 3.6)
+
+## Version Configuration.
+## One source, shared with both helpers (#199): src/core/dh_version.h holds
+## e.g. 1.0 as DH_VERSION_MAJOR 1 and DH_VERSION_MINOR 0, and is parsed here.
+set(DH_VERSION_H ${CMAKE_SOURCE_DIR}/src/core/dh_version.h)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${DH_VERSION_H})
+file(READ ${DH_VERSION_H} DH_VERSION_TEXT)
+string(REGEX MATCH "#define DH_VERSION_MAJOR ([0-9]+)" _ "${DH_VERSION_TEXT}")
+set(VERSION_MAJOR ${CMAKE_MATCH_1})
+string(REGEX MATCH "#define DH_VERSION_MINOR ([0-9]+)" _ "${DH_VERSION_TEXT}")
+set(VERSION_MINOR ${CMAKE_MATCH_1})
+if(NOT VERSION_MAJOR MATCHES "^[0-9]+$" OR NOT VERSION_MINOR MATCHES "^[0-9]+$")
+  message(FATAL_ERROR "could not read DH_VERSION_MAJOR/MINOR from ${DH_VERSION_H}")
+endif()
+
+## Release Type Selection
+option(DH_DEBUG "Build a debug version" OFF)
+option(DH_DEBUG_CDC_FLASH "Enable CDC command to trigger bootloader mode" OFF)
+option(DH_DEV_NO_AUTH "Development build: compile out channel authentication; the build identifies itself as such" OFF)
+
+## Hardware Configuration
+set(DP_PIN_DEFAULT 14 CACHE STRING "Default USB D+ Pin Number")
+set(PIO_USE_TINYUSB 1 CACHE STRING "Make TinyUSB Manage the PIO USB Port")
+set(PICO_BOARD "pico")
+
+## Pico SDK Configuration
+set(PICO_SDK_FETCH_FROM_GIT off)
+set(PICO_SDK_PATH ${CMAKE_CURRENT_LIST_DIR}/pico-sdk)
+set(SRC_DIR ${CMAKE_CURRENT_LIST_DIR}/src)
+include(${PICO_SDK_PATH}/pico_sdk_import.cmake)
+
+## Project Setup
+project(deskhop_project C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+set(PICO_COPY_TO_RAM 1)
+
+## Compiler Flags
+set(CMAKE_C_FLAGS "-Ofast -Wall -mcpu=cortex-m0plus -mtune=cortex-m0plus -fstack-usage")
+
+## Initialize Pico SDK
+pico_sdk_init()
+
+## PIO USB Library Setup
+set(PICO_PIO_USB_DIR ${CMAKE_CURRENT_LIST_DIR}/Pico-PIO-USB)
+
+add_library(Pico-PIO-USB STATIC
+  ${PICO_PIO_USB_DIR}/src/pio_usb.c
+  ${PICO_PIO_USB_DIR}/src/pio_usb_host.c
+  ${PICO_PIO_USB_DIR}/src/usb_crc.c
+)
+pico_generate_pio_header(Pico-PIO-USB ${PICO_PIO_USB_DIR}/src/usb_tx.pio)
+pico_generate_pio_header(Pico-PIO-USB ${PICO_PIO_USB_DIR}/src/usb_rx.pio)
+
+target_link_libraries(Pico-PIO-USB PRIVATE
+  pico_stdlib
+  pico_multicore
+  hardware_pio
+  hardware_dma
+)
+target_include_directories(Pico-PIO-USB PRIVATE ${PICO_PIO_USB_DIR})
+
+## Source Files
+set(COMMON_SOURCES
+  ${SRC_DIR}/usb_descriptors.c
+  ${SRC_DIR}/defaults.c
+  ${SRC_DIR}/constants.c
+  ${SRC_DIR}/protocol.c
+  ${SRC_DIR}/hid_parser.c
+  ${SRC_DIR}/hid_report.c
+  ${SRC_DIR}/utils.c
+  ${SRC_DIR}/config_store.c
+  ${SRC_DIR}/config_read_all.c
+  ${SRC_DIR}/cursor_position.c
+  ${SRC_DIR}/cursor_trace.c
+  ${SRC_DIR}/identity_store.c
+  ${SRC_DIR}/peer_fw.c
+  ${SRC_DIR}/fw_upgrade.c
+  ${SRC_DIR}/config_exit.c
+  ${SRC_DIR}/handlers.c
+  ${SRC_DIR}/setup.c
+  ${SRC_DIR}/keyboard.c
+  ${SRC_DIR}/mouse.c
+  ${SRC_DIR}/mouse_logic.c
+  ${SRC_DIR}/tasks.c
+  ${SRC_DIR}/led.c
+  ${SRC_DIR}/uart.c
+  ${SRC_DIR}/usb.c
+  ${SRC_DIR}/usb_control.c
+  ${SRC_DIR}/channel.c
+  ${SRC_DIR}/channel_lifecycle.c
+  ${SRC_DIR}/main.c
+  ${SRC_DIR}/ramdisk.c
+  ${SRC_DIR}/core/dh_frame.c
+  ${SRC_DIR}/core/dh_config_text.c
+  ${SRC_DIR}/core/dh_cursor_trace.c
+  ${SRC_DIR}/core/dh_hotkey.c
+  ${SRC_DIR}/core/dh_keyboard_transport.c
+  ${SRC_DIR}/core/dh_keyboard_output.c
+  ${SRC_DIR}/core/dh_mouse_layout.c
+  ${SRC_DIR}/core/dh_seam_map.c
+  ${SRC_DIR}/core/dh_place.c
+  ${SRC_DIR}/core/dh_session.c
+  ${SRC_DIR}/core/dh_relay.c
+  ${SRC_DIR}/core/dh_outq.c
+  ${SRC_DIR}/core/dh_inq.c
+  ${SRC_DIR}/core/dh_pair.c
+  ${SRC_DIR}/core/dh_sha256.c
+  ${SRC_DIR}/core/dh_p256.c
+  ${SRC_DIR}/core/dh_auth.c
+  ${SRC_DIR}/bench_ecdh.c   # empty unless DH_BENCH_ECDH is on
+  ${SRC_DIR}/bench_uart.c   # empty unless DH_BENCH_UART is on
+  ${SRC_DIR}/core/dh_crc32.c
+  ${SRC_DIR}/core/dh_clip.c
+  ${SRC_DIR}/core/dh_xfer.c
+  ${PICO_TINYUSB_PATH}/src/portable/raspberrypi/pio_usb/dcd_pio_usb.c
+  ${PICO_TINYUSB_PATH}/src/portable/raspberrypi/pio_usb/hcd_pio_usb.c
+)
+
+## Include Directories
+set(COMMON_INCLUDES
+  ${SRC_DIR}/include
+  ${SRC_DIR}/core
+  ${PICO_PIO_USB_DIR}/src
+)
+
+## Library Dependencies
+set(COMMON_LINK_LIBRARIES
+  pico_stdlib
+  hardware_flash
+  hardware_uart
+  hardware_gpio
+  hardware_pio
+  hardware_dma
+
+  tinyusb_device 
+  tinyusb_host
+  pico_multicore
+  pico_unique_id
+  pico_rand
+  Pico-PIO-USB
+)
+set(binary deskhop)
+
+## Disk Image Configuration
+# This assembles disk.S, then updates the elf section in post-build
+# With the disk FAT image binary in /disk/disk.img 
+
+set(DISK_ASM "${CMAKE_CURRENT_LIST_DIR}/disk/disk.S")
+set(DISK_BIN "${CMAKE_CURRENT_LIST_DIR}/disk/disk.img")
+set(DISK_DIR "${CMAKE_CURRENT_LIST_DIR}/disk")
+set(WEB_DIR  "${CMAKE_CURRENT_LIST_DIR}/webconfig")
+set(CONFIG_PAGE "${WEB_DIR}/config.htm")
+set_property(SOURCE ${DISK_ASM} APPEND PROPERTY COMPILE_OPTIONS "-x" "assembler-with-cpp")
+
+# Rendering the page needs jinja2 and python 3.10+ (form.py annotates with
+# `int | None`). webconfig/Makefile owns that decision — it uses a system
+# interpreter that already qualifies and only builds a venv when none does — so
+# ask it rather than second-guessing it here. `can-render` answers without
+# building anything.
+execute_process(
+  COMMAND make -s can-render
+  WORKING_DIRECTORY ${WEB_DIR}
+  RESULT_VARIABLE CAN_RENDER OUTPUT_QUIET ERROR_QUIET)
+
+# CONFIGURE_DEPENDS re-globs at build time on CMake 3.12+; below that it is
+# inert and a *newly added* template needs a re-configure to be noticed.
+if(CAN_RENDER EQUAL 0)
+  file(GLOB_RECURSE CONFIG_UI_SOURCES CONFIGURE_DEPENDS
+       ${WEB_DIR}/templates/* ${WEB_DIR}/form.py ${WEB_DIR}/render.py)
+  add_custom_command(
+    OUTPUT ${CONFIG_PAGE}
+    COMMAND make -s render
+    WORKING_DIRECTORY ${WEB_DIR}
+    DEPENDS ${CONFIG_UI_SOURCES}
+    COMMENT "Rendering the config page"
+    VERBATIM)
+else()
+  message(STATUS "no jinja2 renderer — using the committed config page. "
+                 "Run 'make venv' in webconfig/ to render it from templates.")
+endif()
+
+# The chain the firmware actually depends on: templates -> config.htm ->
+# disk.img -> disk.S. Only the last link used to exist, so editing the config
+# UI and rebuilding produced firmware carrying the previous page (#16).
+#
+# Wired only when mtools is present. The image is committed, so someone
+# building firmware without it still gets a correct build from the checked-in
+# copy rather than a missing-mformat failure — the point of keeping it in the
+# repo. CI has mtools and regenerates both artifacts, so a stale commit is
+# caught there rather than by everyone downstream.
+find_program(MFORMAT_EXECUTABLE mformat)
+if(MFORMAT_EXECUTABLE)
+  add_custom_command(
+    OUTPUT ${DISK_BIN}
+    COMMAND ./create.sh
+    WORKING_DIRECTORY ${DISK_DIR}
+    DEPENDS ${CONFIG_PAGE} ${DISK_DIR}/create.sh ${DISK_DIR}/capacity.py
+    COMMENT "Building the config disk image"
+    VERBATIM)
+  add_custom_target(config_disk DEPENDS ${DISK_BIN})
+else()
+  # Without mtools the image cannot be rebuilt, but the page rule above still
+  # can — and a custom command nothing depends on never runs. Depending on the
+  # page here keeps the render wired, so editing a template is not silently
+  # ignored; the committed image is then simply older than the page it should
+  # contain, which is what the warning is for and what CI catches.
+  message(WARNING "no mtools: the config disk image cannot be rebuilt here. "
+                  "Editing the config UI will re-render the page but NOT the image, "
+                  "so the firmware keeps the committed one. Install mtools to fix this "
+                  "(then delete CMakeCache.txt, which caches the lookup).")
+  add_custom_target(config_disk DEPENDS ${CONFIG_PAGE})
+endif()
+
+# How close the page is to overflowing the shipped 64 kB, reported on every
+# configure rather than only when the image is rebuilt — the headroom is worth
+# seeing before it is gone, not after.
+#
+# Skipped rather than fatal when there is no python3: the firmware build needs
+# one anyway for crc32.py, but this should not be the thing that says so, and
+# an execute_process that cannot launch its child leaves both output variables
+# empty — which used to produce message(FATAL_ERROR "") and an aborted
+# configure with nothing to read.
+find_program(PYTHON3_EXECUTABLE python3)
+if(PYTHON3_EXECUTABLE)
+  execute_process(
+    COMMAND ${PYTHON3_EXECUTABLE} ${DISK_DIR}/capacity.py ${DISK_BIN} ${CONFIG_PAGE}
+    OUTPUT_VARIABLE DISK_USAGE ERROR_VARIABLE DISK_USAGE_ERR
+    RESULT_VARIABLE DISK_USAGE_RC OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT DISK_USAGE_RC EQUAL 0)
+    if(DISK_USAGE OR DISK_USAGE_ERR)
+      message(FATAL_ERROR "${DISK_USAGE}${DISK_USAGE_ERR}")
+    else()
+      message(FATAL_ERROR "capacity.py could not run: ${DISK_USAGE_RC}")
+    endif()
+  endif()
+  message(STATUS "${DISK_USAGE}")
+endif()
+
+# disk.S pulls the image in with .incbin, which CMake's dependency scanning
+# cannot see through — so a rebuilt config UI left the firmware untouched and
+# the old page shipped, looking exactly like a change that did not take.
+set_property(SOURCE ${DISK_ASM} APPEND PROPERTY OBJECT_DEPENDS ${DISK_BIN})
+
+add_executable(${binary} ${DISK_ASM})
+add_dependencies(${binary} config_disk)
+
+target_sources(${binary} PUBLIC ${COMMON_SOURCES})
+target_compile_definitions(${binary} 
+    PRIVATE
+    PIO_USB_USE_TINYUSB=${PIO_USE_TINYUSB}
+    PIO_USB_DP_PIN_DEFAULT=${DP_PIN_DEFAULT}
+    __disk_file_path__="${DISK_BIN}"
+)
+
+## Support building a debug version
+if (DH_DEBUG)
+  add_definitions(-DDH_DEBUG)  
+endif()
+
+if (DH_DEBUG_CDC_FLASH)
+  add_definitions(-DDH_DEBUG_CDC_FLASH)
+endif()
+
+if (DH_DEV_NO_AUTH)
+  add_definitions(-DDH_DEV_NO_AUTH)
+endif()
+  
+target_include_directories(${binary} PUBLIC ${COMMON_INCLUDES})
+target_link_libraries(${binary} PUBLIC ${COMMON_LINK_LIBRARIES})
+
+## Configure Pico Library
+# A measure-only image (#110): times a P-256 ECDH on the real chip and types
+# the answer, because ADR-0008's 80-200 ms estimate is unmeasured and #111 is
+# designed around it. Off by default and never shipped -- the image types into
+# whatever has focus and does nothing else useful.
+#
+#   cmake -S . -B build-bench -DDH_BENCH_ECDH=ON && cmake --build build-bench
+#
+# See tools/board-checks/README.md.
+option(DH_BENCH_ECDH "Build the measure-only ECDH timing image, not the product" OFF)
+if(DH_BENCH_ECDH)
+  target_compile_definitions(${binary} PRIVATE DH_BENCH_ECDH=1)
+  message(WARNING "DH_BENCH_ECDH is ON: this image measures and types, it is not the firmware")
+endif()
+
+# The same idea for the inter-board link (#166): both boards flood it and
+# each types what it sent and what arrived intact, because every figure
+# ADR-0002 holds for that link is arithmetic. Unlike the ECDH image this one
+# keeps its heartbeat, so board B pulls it over the inter-board link -- it
+# takes two boards to measure one, and B cannot be flashed by cable.
+#
+#   cmake -S . -B build-bench -DDH_BENCH_UART=ON && cmake --build build-bench
+option(DH_BENCH_UART "Build the measure-only UART throughput image, not the product" OFF)
+if(DH_BENCH_UART)
+  target_compile_definitions(${binary} PRIVATE DH_BENCH_UART=1)
+  message(WARNING "DH_BENCH_UART is ON: this image floods the inter-board link and types, it is not the firmware")
+endif()
+if(DH_BENCH_ECDH AND DH_BENCH_UART)
+  message(FATAL_ERROR "DH_BENCH_ECDH and DH_BENCH_UART are two images; build one at a time")
+endif()
+
+pico_enable_stdio_usb(${binary} 0)
+pico_enable_stdio_uart(${binary} 0)
+pico_set_linker_script(${binary} ${CMAKE_SOURCE_DIR}/misc/memory_map.ld)
+
+## Build other file formats as well
+pico_add_extra_outputs(${binary})
+
+# For internal firmware use, to simplify comparison: 0.72 -> 172
+# A minor of 1000 would land on the next major's .0, so the encoding caps it.
+if(VERSION_MINOR GREATER 999)
+  message(FATAL_ERROR "DH_VERSION_MINOR ${VERSION_MINOR} does not fit the u16 version encoding (max 999)")
+endif()
+math(EXPR FIRMWARE_VERSION "${VERSION_MAJOR} * 1000 + ${VERSION_MINOR} + 100")
+
+## Post-Build Commands
+add_custom_command(
+    TARGET ${binary} POST_BUILD
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/misc/crc32.py ${binary}.bin ${binary}.crc ${FIRMWARE_VERSION}
+    COMMAND ${CMAKE_OBJCOPY} --update-section .section_metadata=${binary}.crc ${binary}.elf
+    COMMAND ${CMAKE_OBJCOPY} -O binary ${binary}.elf ${binary}.bin
+    COMMAND ${CMAKE_BINARY_DIR}/elf2uf2/elf2uf2 ${binary}.elf ${binary}.uf2
+    COMMENT "Update CRC32 section to match the actual binary"  
+)
+
+## Linker Options
+target_link_options(${binary} PRIVATE
+  -Xlinker
+  --print-memory-usage
+)

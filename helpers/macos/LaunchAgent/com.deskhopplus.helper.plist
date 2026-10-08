@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The macOS helper as a background agent (#33): it starts at login and is
+  restarted after a crash. Exclusivity on the channel is first-come, so
+  starting as early as possible is a real requirement rather than a nicety
+  (ADR-0001) - RunAtLoad, and KeepAlive on failure so a crash costs seconds,
+  not the login.
+
+  ProgramArguments must be edited to the installed binary's path; packaging
+  and distribution are out of scope for this ticket (#42, "Out of Scope").
+  Pointing it straight at .build/release/deskhop-helper in the repo is the
+  usual way to avoid the sudo, and tools/build.sh reads this file so it
+  understands either arrangement.
+
+    cp helpers/macos/LaunchAgent/com.deskhopplus.helper.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.deskhopplus.helper.plist
+
+  launchd holds the binary it started with, so a rebuild is not a deploy:
+  restart the agent, or it keeps running the old one (#93).
+
+    launchctl kickstart -k gui/$(id -u)/com.deskhopplus.helper
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.deskhopplus.helper</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/deskhop-helper</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart after a crash only. A bare <true/> here restarts after any
+         exit, the menu bar's Quit included (#190). -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- A crash loop should not spin: launchd's own ten-second floor applies,
+         and the helper's reconnection backoff handles the device side. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/deskhop-helper.log</string>
+</dict>
+</plist>

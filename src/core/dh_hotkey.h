@@ -1,0 +1,91 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
+/* Copyright (c) 2026 Derek Reynolds */
+
+/*
+ * deskhopplus — SDK-free hotkey matching.
+ */
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "dh_hotkey_actions.h"
+
+#define DH_HOTKEY_KEY_CAPACITY 6u
+
+enum dh_hotkey_action_id {
+#define DH_HOTKEY_ACTION(symbol, name) DH_HOTKEY_ACTION_##symbol,
+    DH_HOTKEY_ACTIONS(DH_HOTKEY_ACTION)
+#undef DH_HOTKEY_ACTION
+    DH_HOTKEY_ACTION_COUNT,
+    /* The pair chord's action. Outside the table on purpose: the table is
+       stored config, and a new entry there is a config version bump (ADR-0014). */
+    DH_HOTKEY_ACTION_PAIR = 0xfe,
+    DH_HOTKEY_ACTION_INVALID = 0xff
+};
+
+typedef struct {
+    uint8_t modifier;
+    uint8_t keys[DH_HOTKEY_KEY_CAPACITY];
+    uint8_t key_count;
+    uint8_t action_id;
+} dh_hotkey_t;
+
+const char *dh_hotkey_action_name(uint8_t action_id);
+uint8_t dh_hotkey_action_id(const char *name);
+bool dh_hotkey_binding_from_usages(dh_hotkey_t *binding, uint8_t action_id,
+                                   const uint8_t *usages, size_t usage_count);
+bool dh_hotkey_table_is_valid(const dh_hotkey_t *hotkeys, size_t count);
+bool dh_hotkey_action_passes_to_os(uint8_t action_id);
+bool dh_hotkey_action_acknowledges(uint8_t action_id);
+/* The action reboots the board or its peer, or wipes config: the OS must get
+   an all-keys-up report before it runs (#273). */
+bool dh_hotkey_action_releases_all_keys(uint8_t action_id);
+
+typedef struct {
+    bool matched;
+    uint8_t action_id;
+    bool pass_to_os;
+    bool acknowledge;
+    bool releases_all_keys;
+    dh_hotkey_t chord; /* the binding that matched */
+} dh_keyboard_hotkey_result_t;
+
+dh_keyboard_hotkey_result_t dh_keyboard_hotkey_resolve(
+    const dh_hotkey_t *hotkeys, size_t count, uint8_t modifier,
+    const uint8_t keys[DH_HOTKEY_KEY_CAPACITY]);
+
+bool dh_hotkey_configure_key(dh_hotkey_t *hotkeys,
+                             size_t count,
+                             uint8_t action_id,
+                             uint8_t configured_key,
+                             uint8_t fallback_key);
+
+void dh_hotkey_prepare(dh_hotkey_t *hotkeys, size_t count);
+
+const dh_hotkey_t *dh_hotkey_match(const dh_hotkey_t *hotkeys,
+                                   size_t count,
+                                   uint8_t modifier,
+                                   const uint8_t keys[DH_HOTKEY_KEY_CAPACITY]);
+/* dh_hotkey_match, but the fixed recovery and pair chords win over the table. */
+const dh_hotkey_t *dh_hotkey_match_with_fixed(
+    const dh_hotkey_t *hotkeys, size_t count, uint8_t modifier,
+    const uint8_t keys[DH_HOTKEY_KEY_CAPACITY]);
+
+/* Keys of a matched chord that the OS must not see until each is released,
+   so the release order of a chord cannot type its keys (#273). */
+typedef struct {
+    uint8_t modifier;
+    uint8_t keys[DH_HOTKEY_KEY_CAPACITY];
+} dh_hotkey_latch_t;
+
+/* Adds a matched chord's keys to the latch. */
+void dh_hotkey_latch_hold(dh_hotkey_latch_t *latch, const dh_hotkey_t *chord);
+/* Lets go of latched keys the keyboards no longer hold. */
+void dh_hotkey_latch_release(dh_hotkey_latch_t *latch, uint8_t modifier,
+                             const uint8_t keys[DH_HOTKEY_KEY_CAPACITY]);
+/* Removes latched keys from a report bound for the OS. Keys stay packed at
+   the front. Reads the latch only, so any path that builds a report can call it. */
+void dh_hotkey_latch_mask(const dh_hotkey_latch_t *latch, uint8_t *modifier,
+                          uint8_t keys[DH_HOTKEY_KEY_CAPACITY]);

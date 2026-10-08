@@ -1,0 +1,122 @@
+{# templates/form.html #}
+
+{% set key = item.key %}
+
+{% macro input(item, type='text', class='api', name='name') %}
+<input class="{{ class }}" type="{{ type }}" name="{{ name }}{{ key }}" data-type="{{ item.type }}" data-key="{{ key }}"{% if item.scale != 1 %} data-scale="{{ item.scale }}"{% endif %}
+  {% if item.scale == 1 %}onchange="valueChangedHandler(this)"{% endif %}
+{% endmacro %}
+
+{% macro label(item, add='') %}
+<label for="f{{ key }}">{{ item.name }}{{ add }}</label>
+{% endmacro %}
+
+{% macro seam_input(key, type, minimum, maximum) %}
+<input class="api seam-input" type="number" data-type="{{ type }}" data-key="{{ key }}"
+  min="{{ minimum }}" max="{{ maximum }}" onchange="valueChangedHandler(this)" />
+{% endmacro %}
+
+{# A read-only reading: the value is text on the right of the row. #}
+{% macro reading(item, attr, hex=False) %}
+<div class="row">
+  {{ label(item) }}
+  {{ input(item, class=('api content' if hex else 'api')) }} id="f{{ key }}" {{ attr }} readonly />
+</div>
+{% endmacro %}
+
+{% block form_render %}
+  {% if item.get("elem") == "hex_info" %}
+    {{ reading(item, 'data-hex', hex=True) }}
+
+  {% elif item.get("elem") == "fw_version" %}
+    {{ reading(item, 'data-fw-ver') }}
+
+  {% elif item.get("elem") == "peer_fw_version" %}
+    {{ reading(item, 'data-peer-fw-ver') }}
+
+  {% elif item.get("elem") == "peer_fw_checksum" %}
+    {{ reading(item, 'data-peer-fw-crc', hex=True) }}
+
+  {% elif item.get("elem") == "dev_build" %}
+    {{ reading(item, 'data-dev-build') }}
+
+  {# The paired helper's key id, in halves. Hidden: only the joined value is
+     worth reading, and it is written into the field below. #}
+  {% elif item.get("elem") == "helper_key_lo" %}
+    {{ input(item, type='hidden') }} data-helper-key-lo readonly />
+
+  {% elif item.get("elem") == "helper_key_hi" %}
+    {{ input(item, type='hidden') }} data-helper-key-hi readonly />
+
+  {% elif item.get("elem") == "helper_paired" %}
+    {{ reading(item, 'data-helper-paired', hex=True) }}
+
+  {% elif item.get("elem") == "label" %}
+    {# A label starts a titled box; main.html's grouped() renders it. #}
+
+  {% elif item.get("elem") == "hotkey" %}
+    <div class="row hotkey-field" data-hotkey-action="{{ item.action }}">
+      <label for="h{{ item.action }}">{{ item.name }}</label>
+      <input id="h{{ item.action }}" class="hotkey-text" type="text" data-hotkey-key="{{ key }}"
+             data-action-name="{{ item.name }}" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+  {% elif item.get("elem") == "keymap" %}
+    <div class="row keymap-field" data-keymap-output="{{ item.keymap_output }}"
+         data-keymap-kind="{{ item.keymap_kind }}">
+      <label for="k{{ item.keymap_output }}{{ item.keymap_kind }}">{{ item.name }}</label>
+      <textarea id="k{{ item.keymap_output }}{{ item.keymap_kind }}" class="keymap-text" rows="3" autocomplete="off" spellcheck="false"
+                placeholder="{% if item.keymap_kind == 'overrides' %}capslock=lctrl{% else %}capslock, f1{% endif %}"></textarea>
+      <small class="keymap-error" aria-live="polite"></small>
+    </div>
+
+  {% elif item.get("elem") == "seam_range" %}
+    <div class="row seam-range">
+      <span>Segment {{ item.segment }}</span>
+      <span class="seam-inputs">
+        <label>Screen {{ seam_input(item.screen_key, 'uint8', 0, 7) }}</label>
+        <label>Start {{ seam_input(item.start_key, 'uint16', 0, 65535) }}</label>
+        <label>End {{ seam_input(item.end_key, 'uint16', 0, 65535) }}</label>
+      </span>
+    </div>
+
+  {% elif item.get("elem") == "range" %}
+    <form class="row">
+      {{ label(item) }}
+      <span class="slider">
+        {{ input(item, class='readout', type='number', name='aInput') }}
+          readonly oninput="this.form.aRange{{ key }}.value=this.value" tabindex="-1" />
+        {{ input(item, class='range api', type='range', name='aRange') }} id="f{{ key }}"
+          min="{{ item['values'].min }}" max="{{ item['values'].max }}" oninput="this.form.aInput{{key}}.value=this.value" />
+      </span>
+    </form>
+
+  {% elif item.get("elem") == "checkbox" %}
+    <div class="row">
+      {{ label(item) }}
+      {{ input(item, type="checkbox", class="api switch") }} id="f{{ key }}" />
+    </div>
+
+  {% elif item["values"] %}
+    <div class="row">
+      {{ label(item) }}
+      <select class="api" data-type="{{ item.type }}" data-key="{{ key }}" id="f{{ key }}" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+      {% for k, v in item["values"].items() %}
+      <option value="{{ k }}">{{ v }}</option>
+      {% endfor %}
+      </select>
+    </div>
+
+  {% else %}
+    <div class="row">
+      {{ label(item) }}
+      {{ input(item, type=('number' if item.scale != 1 else 'text')) }} id="f{{ key }}"{% if item.scale != 1 %}
+        min="0" max="4294.967295" step="0.000001" aria-describedby="timer-range-{{ key }}"{% endif %} />
+      {% if item.scale != 1 %}<span class="timer-hint" id="timer-range-{{ key }}">{% if key in [22, 52] %}0 = no time limit{% else %}0 to under 4,295 seconds{% endif %}</span>{% endif %}
+      {% if item.scale != 1 %}<small class="timer-error" id="timer-error-{{ key }}" aria-live="polite"></small>{% endif %}
+    </div>
+
+  {% endif %}
+{% endblock %}

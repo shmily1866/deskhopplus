@@ -1,0 +1,92 @@
+/*
+ * This file is part of DeskHop (https://github.com/hrvach/deskhop).
+ * Copyright (c) 2025 Hrvoje Cavrak
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * See the file LICENSE for the full license text.
+ * Modified by Derek Reynolds, 2026, for deskhopplus.
+ */
+#pragma once
+
+#include <stdint.h>
+#include "protocol.h"
+
+
+/*==============================================================================
+ *  Constants
+ *==============================================================================*/
+
+/* Preamble */
+#define START1        0xAA
+#define START2        0x55
+#define START_LENGTH  2
+
+/* Packet Queue Definitions  */
+#define UART_QUEUE_LENGTH  256
+#define HID_QUEUE_LENGTH   256
+#define KBD_QUEUE_LENGTH   128
+#define MOUSE_QUEUE_LENGTH 512
+
+/* Packet Lengths and Offsets */
+#define PACKET_LENGTH          (TYPE_LENGTH + PACKET_DATA_LENGTH + CHECKSUM_LENGTH)
+#define RAW_PACKET_LENGTH      (START_LENGTH + PACKET_LENGTH)
+
+#define TYPE_LENGTH             1
+#define PACKET_DATA_LENGTH      8 // For simplicity, all packet types are the same length
+#define CHECKSUM_LENGTH         1
+
+#define KEYARRAY_BIT_OFFSET     16
+#define KEYS_IN_USB_REPORT      6
+#define KBD_REPORT_LENGTH       8
+#define MOUSE_REPORT_LENGTH     8
+#define CONSUMER_CONTROL_LENGTH 4
+#define SYSTEM_CONTROL_LENGTH   1
+#define MODIFIER_BIT_LENGTH     8
+
+/*==============================================================================
+ *  Data Structures
+ *==============================================================================*/
+
+ typedef struct {
+    uint8_t type;     // Enum field describing the type of packet
+    union {
+        uint8_t data[8];      // Data goes here (type + payload + checksum)
+        uint16_t data16[4];   // We can treat it as 4 16-byte chunks
+        uint32_t data32[2];   // We can treat it as 2 32-byte chunks
+    };
+    uint8_t checksum; // Checksum, a simple XOR-based one
+} __attribute__((packed)) uart_packet_t;
+
+/*==============================================================================
+ *  Heartbeat Payload Layout
+ *==============================================================================*/
+
+/*
+ * Where the heartbeat's three fields sit in the payload, named once because
+ * they are written in tasks.c and read in handlers.c (#91).
+ *
+ * Prose held these two in agreement for one commit and that is one too many:
+ * a writer and a reader that disagree here do not produce a wrong number on a
+ * config page, they produce a checksum mismatch that was never real, and a
+ * board reflashes its peer over it. The checksum moved into bytes 4-7 where
+ * `active_output` used to sit, so the drift this guards against has already
+ * happened once.
+ */
+#define HEARTBEAT_VERSION_SLOT16  0 /* data16[0] — the sender's firmware version  */
+#define HEARTBEAT_OUTPUT_SLOT16   1 /* data16[1] — the sender's active output     */
+#define HEARTBEAT_CHECKSUM_SLOT32 1 /* data32[1] — the sender's firmware CRC32    */
+#define HEARTBEAT_BOOT_MOUSE_BIT  0x8000u /* data16[1] — sender's boot mouse mode */
+#define HEARTBEAT_HELPER_BIT      0x4000u /* data16[1] — sender's helper has a session (#275) */
+
+_Static_assert((HEARTBEAT_HELPER_BIT & HEARTBEAT_BOOT_MOUSE_BIT) == 0 && HEARTBEAT_HELPER_BIT > 1u,
+               "heartbeat: the flags must not overlap each other or the active output (0 or 1)");
+
+_Static_assert(HEARTBEAT_CHECKSUM_SLOT32 * sizeof(uint32_t)
+                   >= (HEARTBEAT_OUTPUT_SLOT16 + 1) * sizeof(uint16_t),
+               "heartbeat: the checksum must not overlap the version or active output");
+
+_Static_assert((HEARTBEAT_CHECKSUM_SLOT32 + 1) * sizeof(uint32_t) <= PACKET_DATA_LENGTH,
+               "heartbeat: the checksum must fit inside the payload");

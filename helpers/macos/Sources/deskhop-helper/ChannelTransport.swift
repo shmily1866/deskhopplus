@@ -1,0 +1,321 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (c) 2026 Derek Reynolds
+
+import DeskhopChannel
+import DHCore
+import Foundation
+import IOKit
+import IOKit.hid
+
+/*
+ * The IOKit end of the channel: find the device, seize every channel or none,
+ * carry reports in and out. It decides nothing — it reports what it sees to
+ * the session and does what the session asks (HelperSession.swift, which is
+ * itself only a binding onto the shared core's machine).
+ *
+ * Platform-boundary code, verified by hand and by use rather than at a seam
+ * (#42, "Not tested at a seam").
+ */
+final class ChannelTransport {
+    /// Events for the session.
+    var onEvent: ((SessionInput) -> Void)?
+    /// Diagnostics.
+    var log: ((String) -> Void)?
+
+    private final class Channel {
+        let device: IOHIDDevice
+        let index: UInt8
+        let mode: DeviceIdentity
+        weak var transport: ChannelTransport?
+        /* IOKit writes input reports into this buffer for the lifetime of the
+           callback registration, so it outlives every call. */
+        let buffer: UnsafeMutablePointer<UInt8>
+        var opened = false
+
+        init(device: IOHIDDevice, index: UInt8, mode: DeviceIdentity, transport: ChannelTransport) {
+            self.index = index
+            self.mode = mode
+            self.transport = transport
+            self.device = device
+            self.buffer = .allocate(capacity: ChannelIdentity.reportSize)
+            buffer.initialize(repeating: 0, count: ChannelIdentity.reportSize)
+        }
+
+        deinit { buffer.deallocate() }
+    }
+
+    private let manager: IOHIDManager
+    private var channels: [Channel] = []
+    private var configModeNodes: [IOHIDDevice] = []
+    private var nextStriped = 0
+
+    /*
+     * The serial of the device this helper is talking to. Every channel must
+     * belong to it: the identity is the USB identifier and serial, never a
+     * device path, which on neither platform survives a reconnect.
+     */
+    private(set) var serial: String?
+
+    init() {
+        manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+    }
+
+    // MARK: - Discovery
+
+    func start() {
+        /*
+         * Match narrowly: the identifier and the vendor usage page, which
+         * holds only the helper channels and, in config mode, the config API
+         * (seen for presence). Broad matching would open a keyboard and
+         * trigger an Input Monitoring prompt — the mistake behind most public
+         * claims that HID access requires one (ADR-0001).
+         */
+        let matching: [String: Any] = [
+            kIOHIDVendorIDKey: ChannelIdentity.vendorID,
+            kIOHIDProductIDKey: ChannelIdentity.productID,
+            kIOHIDDeviceUsagePageKey: ChannelIdentity.usagePage,
+        ]
+        IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
+
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, { context, _, _, device in
+            guard let context else { return }
+            Unmanaged<ChannelTransport>.fromOpaque(context).takeUnretainedValue().matched(device)
+        }, context)
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, { context, _, _, device in
+            guard let context else { return }
+            Unmanaged<ChannelTransport>.fromOpaque(context).takeUnretainedValue().removed(device)
+        }, context)
+
+        /*
+         * `.commonModes`, not `.defaultMode`. AppKit runs the loop in
+         * `.eventTracking` for as long as a menu is open, and a source
+         * scheduled in the default mode alone is not serviced in it — so with
+         * the menu bar item open this helper stopped *reading* from the board.
+         * Its own liveness check then fired ("nothing from the device in
+         * 3.0s") and it dropped a session that was perfectly healthy.
+         *
+         * The twin of what HelperRuntime.everyMode fixes for the sending
+         * direction. Both had to move: a beat that goes out while nothing comes
+         * in still ends the session, just from the other end (#161).
+         */
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetCurrent(),
+                                        CFRunLoopMode.commonModes.rawValue)
+        IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+    }
+
+    private func matched(_ device: IOHIDDevice) {
+        /* `DeviceUsage` is a *matching* key only; as a property it reads nil
+           on every macOS tested, which silently dropped every channel (#176).
+           The value lives under `PrimaryUsage`. */
+        guard let kind = ChannelIdentity.collection(
+            usage: property(device, kIOHIDPrimaryUsageKey) as? Int) else {
+            log?("ignoring a vendor collection with usage \(String(describing: property(device, kIOHIDPrimaryUsageKey)))")
+            return
+        }
+        let mode = kind.mode
+        let deviceSerial = property(device, kIOHIDSerialNumberKey) as? String
+        if let known = serial, let deviceSerial, known != deviceSerial {
+            /* Behaviour with more than one device attached is out of scope
+               (#42); the first serial seen wins, and the rest is ignored
+               rather than silently mixed into one session. */
+            log?("ignoring a second device with serial \(deviceSerial); holding \(known)")
+            return
+        }
+        if let first = channels.first, first.mode != mode {
+            release()
+            channels.removeAll()
+            serial = nil
+        }
+        serial = deviceSerial ?? serial
+
+        if mode == .configMode && !configModeNodes.contains(device) {
+            configModeNodes.append(device)
+        }
+
+        let index: UInt8
+        switch kind {
+        case .normalChannel(let n): index = n
+        case .configChannel: index = 0
+        case .configApi:
+            onEvent?(.deviceAppeared(.configMode))
+            return
+        }
+        guard !channels.contains(where: { $0.device == device }) else { return }
+        if isHoldingChannels {
+            release()
+            onEvent?(.transportFailed("channel set changed"))
+        }
+        channels.append(Channel(device: device, index: index, mode: mode, transport: self))
+        channels.sort { $0.index < $1.index }
+        log?("channel found on serial \(serial ?? "(none exposed)"): \(channels.count) so far")
+        onEvent?(.deviceAppeared(mode))
+    }
+
+    private func removed(_ device: IOHIDDevice) {
+        /* Read nothing off a device that is going away: what this helper
+           recorded when it matched says what the device was. */
+        configModeNodes.removeAll { $0 == device }
+
+        guard channels.contains(where: { $0.device == device }) else {
+            if configModeNodes.isEmpty && channels.isEmpty { onEvent?(.deviceDisappeared) }
+            return
+        }
+        release()
+        onEvent?(.transportFailed("channel removed"))
+        /* Unregister before the channel is dropped: the callback holds the
+           buffer the channel owns, and the channel deallocates it. */
+        for channel in channels where channel.device == device {
+            unlisten(channel)
+        }
+        channels.removeAll { $0.device == device }
+
+        if channels.isEmpty && configModeNodes.isEmpty {
+            serial = nil
+            onEvent?(.deviceDisappeared)
+        }
+    }
+
+    private func property(_ device: IOHIDDevice, _ key: String) -> Any? {
+        IOHIDDeviceGetProperty(device, key as CFString)
+    }
+
+    // MARK: - Exclusivity
+
+    /*
+     * Seize every channel or none (ADR-0002). Partial acquisition is the
+     * dangerous state, not the tolerable one: a second process holding one
+     * channel would silently receive part of every bulk transfer while both
+     * sides looked healthy — so anything short of all is rolled back and
+     * reported as a refusal.
+     */
+    func acquire() {
+        guard !channels.isEmpty else { return }
+        guard channels.enumerated().allSatisfy({ Int($0.element.index) == $0.offset }) else {
+            release()
+            onEvent?(.acquisitionRefused(acquired: 0, of: channels.count))
+            return
+        }
+        /* Nothing to do when every channel is already held. With more than one
+           channel (#63) the nodes arrive one at a time, so this runs again as
+           each turns up and the session is re-established on the full set. */
+        guard channels.contains(where: { !$0.opened }) else { return }
+
+        var acquired = 0
+        for channel in channels {
+            if channel.opened {
+                acquired += 1
+                continue
+            }
+            let result = IOHIDDeviceOpen(channel.device,
+                                         IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
+            guard result == kIOReturnSuccess else {
+                log?("exclusive open refused: \(String(format: "0x%08x", result))")
+                break
+            }
+            channel.opened = true
+            listen(to: channel)
+            acquired += 1
+        }
+
+        guard acquired == channels.count else {
+            release()
+            onEvent?(.acquisitionRefused(acquired: acquired, of: channels.count))
+            return
+        }
+
+        log?("holding \(acquired) channel(s) exclusively")
+        onEvent?(.channelsAcquired(count: acquired))
+    }
+
+    func release() {
+        nextStriped = 0
+        for channel in channels where channel.opened {
+            unlisten(channel)
+            IOHIDDeviceClose(channel.device, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
+            channel.opened = false
+        }
+    }
+
+    private func unlisten(_ channel: Channel) {
+        guard channel.opened else { return }
+        IOHIDDeviceRegisterInputReportCallback(channel.device, channel.buffer,
+                                               ChannelIdentity.reportSize, nil, nil)
+    }
+
+    private func listen(to channel: Channel) {
+        let context = Unmanaged.passUnretained(channel).toOpaque()
+        IOHIDDeviceRegisterInputReportCallback(
+            channel.device, channel.buffer, ChannelIdentity.reportSize,
+            { context, _, _, _, _, report, length in
+                guard let context, length > 0 else { return }
+                let channel = Unmanaged<Channel>.fromOpaque(context).takeUnretainedValue()
+                channel.transport?.onEvent?(.receivedOnChannel(channel.index,
+                    Array(UnsafeBufferPointer(start: report, count: Int(length)))))
+            }, context)
+    }
+
+    // MARK: - Writing
+
+    /*
+     * Only chunks rotate through the negotiated set (dh_msg_is_striped);
+     * session, control and the transfer's own credits and requests stay on
+     * channel 0. A report is a fixed 64 bytes with a padded tail, since it
+     * carries no length of its own.
+     */
+    /// Whether the frame actually went out. The answer matters to ADR-0004's
+    /// idle timer: a caller that charged it for a frame this refused would
+    /// suppress a heartbeat that was owed (`HelperSession.emit`).
+    /* Deliberately not @discardableResult: every caller has to decide what a
+       refusal means, because a caller that ignores it charges ADR-0004's idle
+       timer for a frame that never went out. That is exactly what #107 was. */
+    func send(_ frameBytes: [UInt8], channelCount: UInt8 = 1) -> Bool {
+        let count = Int(channelCount)
+        let striped = frameBytes.first.map { dh_msg_is_striped($0) } ?? false
+        let index = striped && count > 0 ? nextStriped % count : 0
+        guard count > 0, count <= channels.count,
+              channels.allSatisfy({ $0.opened }),
+              let channel = channels.first(where: { Int($0.index) == index }) else {
+            log?("dropped \(frameBytes.count) bytes: no channel held")
+            return false
+        }
+
+        let frame: Frame
+        do {
+            frame = try FrameCodec.decode(frameBytes).frame
+        } catch {
+            log?("refusing to send bytes that are not a frame: \(error)")
+            return false
+        }
+
+        /* The other refusals above all say why. This one used to throw its
+           error away, which made a frame the codec could not carve into
+           reports look exactly like one the device dropped (#132). */
+        let reports: [[UInt8]]
+        do {
+            reports = try FrameCodec.reports(for: [frame])
+        } catch {
+            log?("a frame could not be turned into reports: \(error)")
+            return false
+        }
+        for report in reports {
+            let result = report.withUnsafeBufferPointer { buffer in
+                IOHIDDeviceSetReport(channel.device, kIOHIDReportTypeOutput, 0,
+                                     buffer.baseAddress!, buffer.count)
+            }
+            if result != kIOReturnSuccess {
+                /* A refused write is a handle that can no longer be trusted —
+                   the device has stopped draining or gone. The connection goes;
+                   this is not a retryable write (dh_helper.h). */
+                onEvent?(.transportFailed("report write failed: "
+                                          + String(format: "0x%08x", result)))
+                return false
+            }
+        }
+        if striped { nextStriped = (index + 1) % count }
+        return true
+    }
+
+    var isHoldingChannels: Bool { channels.contains { $0.opened } }
+    var hasDevice: Bool { !channels.isEmpty }
+}

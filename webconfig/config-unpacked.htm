@@ -1,0 +1,4731 @@
+
+
+
+
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <style>
+    /* The config page as a settings window: sidebar, toolbar, grouped rows.
+   Tokens first; dark follows the OS. Everything is inline and hand-written
+   because the page ships on a 64 kB disk with no network (PRODUCT.md). */
+
+:root {
+  --ground: #ececec;
+  --pane: #f5f5f7;
+  --box: #ffffff;
+  --well: #e4e4e8;
+  --line: #d2d2d7;
+  --ink: #1d1d1f;
+  --ink-2: #6e6e73;
+  --accent: #0a60ff;
+  --on-accent: #ffffff;
+  --monitor: #c7c7cc;
+  --monitor-ink: #3a3a3c;
+  --handle: #4a4a4e;
+  --warn: #ffd60a;
+  --warn-ink: #1d1d1f;
+  --bad: #d70015;
+  --focus: #0a60ff66;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #1e1e1e;
+    --pane: #2a2a2c;
+    --box: #353538;
+    --well: #232325;
+    --line: #48484c;
+    --ink: #f2f2f7;
+    --ink-2: #a1a1a6;
+    --accent: #2f6fe0;
+    --monitor: #5a5a5f;
+    --monitor-ink: #f2f2f7;
+    --handle: #5a5a5f;
+    --warn: #ffd60a;
+    --warn-ink: #1d1d1f;
+    --bad: #ff6961;
+    --focus: #2f6fe080;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { height: 100%; }
+
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--pane);
+  color: var(--ink);
+  font: 13px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
+  accent-color: var(--accent);
+}
+
+::selection { background: var(--accent); color: var(--on-accent); }
+
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 1px; }
+
+/* Window: sidebar and pane */
+
+.window { display: flex; min-height: 100vh; }
+
+.sidebar {
+  flex: 0 0 220px;
+  padding: 16px 12px;
+  background: var(--ground);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar h1 {
+  margin: 0 8px 14px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar button {
+  text-align: left;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  position: relative;
+}
+
+.sidebar button:hover { background: color-mix(in srgb, var(--ink) 8%, transparent); }
+
+.sidebar button[aria-current="page"] { background: var(--accent); color: var(--on-accent); }
+
+/* A section holding unsaved changes or an invalid field says so with a dot. */
+.sidebar button[data-unsaved]::after {
+  content: "";
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.pane { flex: 1 1 auto; min-width: 0; }
+
+main { padding: 8px 24px 40px; max-width: 760px; }
+
+#fields { margin: 0; padding: 0; border: 0; min-width: 0; }
+
+section[data-section][hidden] { display: none; }
+
+/* Toolbar */
+
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 44px;
+  padding: 0 24px;
+  background: var(--pane);
+  border-bottom: 1px solid var(--line);
+}
+
+.toolbar p { margin: 0; color: var(--ink-2); }
+
+#connection[data-on="1"] { color: var(--ink); }
+
+#menu-buttons { display: flex; gap: 8px; }
+
+button, select, input, textarea { font: inherit; color: inherit; }
+
+.toolbar button, #service-buttons button, .layout-counts button, .row button {
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--box);
+  cursor: pointer;
+}
+
+.toolbar button:hover, #service-buttons button:hover, .layout-counts button:hover, .row button:hover {
+  background: color-mix(in srgb, var(--box) 85%, var(--ink));
+}
+
+.toolbar button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+
+.toolbar button.primary:hover { background: color-mix(in srgb, var(--accent) 85%, black); }
+
+button:disabled { opacity: 0.45; cursor: default; }
+
+button:disabled:hover { background: var(--box); }
+
+.toolbar button.primary:disabled:hover { background: var(--accent); }
+
+#unsaved { margin-left: 6px; padding: 0 6px; border-radius: 8px; background: var(--on-accent); color: var(--accent); font-size: 11px; }
+
+#service-buttons button[data-armed] { background: var(--warn); border-color: var(--warn); color: var(--warn-ink); }
+
+/* Refusal and browser warning strips */
+
+.strip {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 16px 24px 0;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--warn);
+  color: var(--warn-ink);
+}
+
+.strip[hidden] { display: none; }
+
+.strip svg { flex: none; margin-top: 2px; }
+
+.strip strong { font-weight: 600; }
+
+.strip ul { margin: 6px 0 0; padding-left: 18px; }
+
+.strip a { color: inherit; font-weight: 600; }
+
+/* Sections and rows */
+
+h2 { margin: 20px 0 12px; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+
+h3 { margin: 24px 0 8px; font-size: 13px; font-weight: 600; }
+
+/* A group title sits above its box, as the OS sets them. */
+h3.sub { margin: 18px 0 6px 14px; font-size: 11px; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.04em; }
+
+h3.sub:first-child { margin-top: 8px; }
+
+.hint { margin: 8px 0 0; max-width: 72ch; color: var(--ink-2); font-size: 12px; }
+
+.group {
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--box);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  min-height: 40px;
+  padding: 6px 14px;
+  margin: 0;
+}
+
+.row + .row { border-top: 1px solid var(--line); }
+
+.group + .group { margin-top: 12px; }
+
+.row > label, .row > span:first-child { flex: 1 1 160px; }
+
+.row > small { flex-basis: 100%; }
+
+.row > .timer-hint { flex-basis: 100%; color: var(--ink-2); font-size: 12px; }
+
+.row input[type="text"], .row input[type="number"], .row textarea, .row select {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--pane);
+  min-width: 0;
+}
+
+/* Wide enough for a six-key chord such as lctrl+rshift+lalt+ralt+capslock+f12. */
+.row input[type="text"] { width: 260px; }
+
+.row input[type="number"] { width: 100px; }
+
+.row input[type="number"][data-scale] { width: 148px; font-variant-numeric: tabular-nums; }
+
+.row input[readonly] { background: transparent; border-color: transparent; text-align: right; color: var(--ink-2); }
+
+.row input[readonly].content { font-variant-numeric: tabular-nums; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+
+.row input[readonly].dev-warning { color: var(--bad); }
+
+.row textarea { width: 280px; resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+
+.row select {
+  appearance: none;
+  padding-right: 24px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+
+.row input[aria-invalid], .row textarea[aria-invalid] { border-color: var(--bad); }
+
+.hotkey-error, .keymap-error, .timer-error { color: var(--bad); font-size: 12px; }
+
+.hotkey-error:empty, .keymap-error:empty, .timer-error:empty { display: none; }
+
+/* Switch: a checkbox drawn as the OS draws one. */
+.switch {
+  appearance: none;
+  width: 34px;
+  height: 20px;
+  margin: 0;
+  border-radius: 10px;
+  background: var(--monitor);
+  position: relative;
+  cursor: pointer;
+  transition: background 120ms ease-out;
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+  transition: left 120ms ease-out;
+}
+
+.switch:checked { background: var(--accent); }
+
+.switch:checked::after { left: 16px; }
+
+/* Slider with its readout */
+.slider { display: flex; align-items: center; gap: 10px; }
+
+.slider .readout { width: 48px; text-align: right; border: 0; background: transparent; padding: 0; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+
+.slider .range { width: 160px; margin: 0; }
+
+.seam-inputs { display: flex; gap: 8px; }
+
+.seam-inputs label { display: flex; align-items: center; gap: 4px; color: var(--ink-2); font-size: 12px; }
+
+.seam-inputs input { width: 72px; }
+
+/* Advanced: a disclosure line; its content is titled boxes like the rest. */
+#advanced { margin-top: 18px; }
+
+summary { padding: 6px 0; cursor: pointer; font-weight: 600; width: max-content; }
+
+pre {
+  margin: 0;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  font: 11px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ink-2);
+}
+
+/* The layout well and the picture in it */
+
+/* The well is the page's peak: the desk fills it, everything else is quiet. */
+.well {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 460px;
+  padding: 24px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--well);
+  text-align: center;
+}
+
+#layout { color: var(--ink-2); overflow-x: auto; }
+
+/* layout.js caps the height inline at the canvas size; the well overrides
+   that so the desk is drawn at hero scale, not as a thumbnail. */
+#layout svg { display: block; margin: 0 auto; width: 100%; max-width: 100%; max-height: 380px !important; }
+
+#layout-status { margin: 8px 0 0; min-height: 1.45em; color: var(--bad); }
+
+#layout-status.layout-ok { color: var(--ink-2); }
+
+#layout-status:empty { margin: 0; min-height: 0; }
+
+.layout-counts { margin: 16px 0 0; display: flex; justify-content: center; gap: 32px; color: var(--ink); }
+
+.layout-counts button { padding: 0 12px; line-height: 26px; font-size: 15px; }
+
+.layout-handle { cursor: grab; }
+
+.layout-handle rect { fill: var(--handle); }
+
+/* 10px regular: a one-monitor bar must still hold "B · Windows" in Linux Chrome's wider fonts (CI). */
+.layout-handle text { fill: #fff; font-size: 10px; text-anchor: middle; pointer-events: none; }
+
+.layout-box { cursor: grab; outline: none; }
+
+.layout-monitor { fill: var(--monitor); stroke: var(--monitor-ink); stroke-width: 1.5; transition: fill 120ms ease-out; }
+
+.layout-main { stroke-width: 3; }
+
+.layout-box text { fill: var(--monitor-ink); font-size: 13px; font-weight: 600; text-anchor: middle; pointer-events: none; }
+
+.layout-box:focus-visible .layout-monitor { stroke: var(--accent); }
+
+#layout[data-selected="A"] .layout-A .layout-monitor,
+#layout[data-selected="B"] .layout-B .layout-monitor { fill: var(--accent); stroke: var(--accent); }
+
+#layout[data-selected="A"] .layout-A .layout-main,
+#layout[data-selected="B"] .layout-B .layout-main { stroke: var(--on-accent); }
+
+#layout[data-selected="A"] .layout-A text,
+#layout[data-selected="B"] .layout-B text { fill: var(--on-accent); }
+
+#layout[data-selected="A"] .layout-A .layout-handle rect,
+#layout[data-selected="B"] .layout-B .layout-handle rect { fill: var(--accent); }
+
+/* Segments: ink bands with well-coloured numbers, so both schemes stay in the one-accent palette. */
+.layout-band { stroke: var(--monitor-ink); stroke-width: 8; stroke-linecap: round; }
+
+.layout-band-number { fill: var(--well); paint-order: stroke; stroke: var(--monitor-ink); stroke-width: 4px; font-size: 12px; font-weight: 700; text-anchor: middle; pointer-events: none; }
+
+/* Narrow window: the sidebar folds into a row of section names. */
+@media (max-width: 800px) {
+  .window { flex-direction: column; }
+  .sidebar { flex: none; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px; padding: 10px 12px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .sidebar h1 { flex-basis: 100%; margin: 0 8px 6px; }
+  .toolbar { position: static; flex-wrap: wrap; height: auto; min-height: 44px; padding: 6px 16px; }
+  main { padding: 8px 16px 40px; }
+  .strip { margin: 12px 16px 0; }
+  .row input[type="text"], .row textarea { width: 100%; }
+  .slider .range { width: 120px; }
+  .layout-counts { flex-wrap: wrap; gap: 12px; }
+}
+
+/* Phone width: nothing in a row is wider than the row. */
+@media (max-width: 480px) {
+  .slider, .seam-inputs { flex: 1 1 100%; flex-wrap: wrap; }
+  .slider .range { flex: 1 1 120px; }
+  .row input[type="number"] { width: 80px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch, .switch::after, .layout-monitor { transition: none; }
+}
+  </style>
+
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cstyle%3Esvg{fill:%231d1d1f}@media(prefers-color-scheme:dark){svg{fill:%23f2f2f7}}%3C/style%3E%3Crect x='1' y='4' width='6' height='8' rx='1'/%3E%3Crect x='9' y='4' width='6' height='8' rx='1'/%3E%3Crect x='7' y='7.25' width='2' height='1.5'/%3E%3C/svg%3E">
+  <title>DeskHopPlus</title>
+</head>
+
+<body>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="window">
+  <nav class="sidebar" id="sidebar" aria-label="Sections">
+    <h1><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="1" y="4" width="6" height="8" rx="1"/><rect x="9" y="4" width="6" height="8" rx="1"/><rect x="7" y="7.25" width="2" height="1.5"/></svg>DeskHopPlus</h1>
+
+    <button type="button" data-section="desk" aria-current="page">Desk</button>
+
+    <button type="button" data-section="keyboard">Keyboard & Mouse</button>
+
+    <button type="button" data-section="hotkeys">Hotkeys</button>
+
+    <button type="button" data-section="clipboard">Clipboard</button>
+
+    <button type="button" data-section="status">Status</button>
+
+    <button type="button" data-section="service">Service</button>
+
+  </nav>
+
+  <div class="pane">
+    <header class="toolbar">
+      <p id="connection" aria-live="polite">Not connected</p>
+      <div id="menu-buttons">
+        <button type="button" data-handler="connectHandler">Connect</button>
+        <button type="button" data-handler="readHandler" class="online" disabled>Read</button>
+        <button type="button" data-handler="saveHandler" class="online primary" disabled>Save<span id="unsaved" hidden></span></button>
+        <button type="button" data-handler="rebootHandler" class="online" disabled>Exit</button>
+      </div>
+    </header>
+
+    <div id="warning" class="strip" role="alert" hidden><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 4.5v4.2M8 11.6v.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><div>
+      <strong>This browser has no WebHID.</strong> Open this page in Chrome or another
+      Chromium browser to connect to the board.
+    </div></div>
+    <div id="refusal" class="strip" role="alert" hidden><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 4.5v4.2M8 11.6v.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><div></div></div>
+
+    <main id="main">
+      <fieldset id="fields" disabled>
+      <section data-section="desk" aria-labelledby="desk-title">
+        <h2 id="desk-title">Desk</h2>
+        <div class="well">
+          <div id="layout" data-selected="A">Connect to see your monitor layout.</div>
+          <p id="layout-status" aria-live="polite"></p>
+        </div>
+        <p class="hint">Drag a label to move a computer; drag Main onto its last numbered monitor to flip it.
+          The snapped drop is checked while you drag. Click a computer to see its settings below.
+          Along-seam offsets are stored in the Segment Start and End values under Advanced.</p>
+        <p class="hint">Save, then try the layout while this page stays connected. Wait for the helper
+          to say “Connected and paired — config mode” for correct multi-monitor hops. If it says
+          “Device in config mode”, Exit before testing multi-monitor hops. Config mode reboots on
+          entry and Exit, and ends automatically after five minutes. On a Mac, eject the DESKHOP
+          drive in Finder before Exit or the timeout: macOS can hang its disk mounter when a
+          mounted drive vanishes.</p>
+
+
+        <div class="computer" data-computer="A">
+          <h3>Output A<span data-os-of="A"></span></h3>
+
+
+
+
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <form class="row">
+
+<label for="f12">Speed X</label>
+
+      <span class="slider">
+
+<input class="readout" type="number" name="aInput12" data-type="int32" data-key="12"
+  onchange="valueChangedHandler(this)"
+
+          readonly oninput="this.form.aRange12.value=this.value" tabindex="-1" />
+
+<input class="range api" type="range" name="aRange12" data-type="int32" data-key="12"
+  onchange="valueChangedHandler(this)"
+ id="f12"
+          min="1" max="100" oninput="this.form.aInput12.value=this.value" />
+      </span>
+    </form>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <form class="row">
+
+<label for="f13">Speed Y</label>
+
+      <span class="slider">
+
+<input class="readout" type="number" name="aInput13" data-type="int32" data-key="13"
+  onchange="valueChangedHandler(this)"
+
+          readonly oninput="this.form.aRange13.value=this.value" tabindex="-1" />
+
+<input class="range api" type="range" name="aRange13" data-type="int32" data-key="13"
+  onchange="valueChangedHandler(this)"
+ id="f13"
+          min="1" max="100" oninput="this.form.aInput13.value=this.value" />
+      </span>
+    </form>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f16">Operating System</label>
+
+      <select class="api" data-type="uint8" data-key="16" id="f16" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="1">Linux</option>
+
+      <option value="2">MacOS</option>
+
+      <option value="3">Windows</option>
+
+      <option value="4">Android</option>
+
+      <option value="255">Other</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f18">Cursor Park Position</label>
+
+      <select class="api" data-type="uint8" data-key="18" id="f18" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="0">Top</option>
+
+      <option value="1">Bottom</option>
+
+      <option value="3">Previous</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+      </div>
+      <h3 class="sub">Screensaver</h3>
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f19">Mode</label>
+
+      <select class="api" data-type="uint8" data-key="19" id="f19" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="0">Disabled</option>
+
+      <option value="1">Pong</option>
+
+      <option value="2">Jitter</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f20">Only If Inactive</label>
+
+
+<input class="api switch" type="checkbox" name="name20" data-type="uint8" data-key="20"
+  onchange="valueChangedHandler(this)"
+ id="f20" />
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f21">Idle Time (seconds)</label>
+
+
+<input class="api" type="number" name="name21" data-type="uint64" data-key="21" data-scale="1000000"
+
+ id="f21"
+        min="0" max="4294.967295" step="0.000001" aria-describedby="timer-range-21" />
+      <span class="timer-hint" id="timer-range-21">0 to under 4,295 seconds</span>
+      <small class="timer-error" id="timer-error-21" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f22">Max Time (seconds)</label>
+
+
+<input class="api" type="number" name="name22" data-type="uint64" data-key="22" data-scale="1000000"
+
+ id="f22"
+        min="0" max="4294.967295" step="0.000001" aria-describedby="timer-range-22" />
+      <span class="timer-hint" id="timer-range-22">0 = no time limit</span>
+      <small class="timer-error" id="timer-error-22" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+      </div>
+      <h3 class="sub">Key mapping</h3>
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f23">Swap Ctrl and Cmd</label>
+
+
+<input class="api switch" type="checkbox" name="name23" data-type="uint8" data-key="23"
+  onchange="valueChangedHandler(this)"
+ id="f23" />
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row keymap-field" data-keymap-output="0"
+         data-keymap-kind="overrides">
+      <label for="k0overrides">Key overrides</label>
+      <textarea id="k0overrides" class="keymap-text" rows="3" autocomplete="off" spellcheck="false"
+                placeholder="capslock=lctrl"></textarea>
+      <small class="keymap-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row keymap-field" data-keymap-output="0"
+         data-keymap-kind="passthrough">
+      <label for="k0passthrough">Passthrough keys</label>
+      <textarea id="k0passthrough" class="keymap-text" rows="3" autocomplete="off" spellcheck="false"
+                placeholder="capslock, f1"></textarea>
+      <small class="keymap-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+  </div>
+
+        </div>
+
+        <div class="computer" data-computer="B" hidden>
+          <h3>Output B<span data-os-of="B"></span></h3>
+
+
+
+
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <form class="row">
+
+<label for="f42">Speed X</label>
+
+      <span class="slider">
+
+<input class="readout" type="number" name="aInput42" data-type="int32" data-key="42"
+  onchange="valueChangedHandler(this)"
+
+          readonly oninput="this.form.aRange42.value=this.value" tabindex="-1" />
+
+<input class="range api" type="range" name="aRange42" data-type="int32" data-key="42"
+  onchange="valueChangedHandler(this)"
+ id="f42"
+          min="1" max="100" oninput="this.form.aInput42.value=this.value" />
+      </span>
+    </form>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <form class="row">
+
+<label for="f43">Speed Y</label>
+
+      <span class="slider">
+
+<input class="readout" type="number" name="aInput43" data-type="int32" data-key="43"
+  onchange="valueChangedHandler(this)"
+
+          readonly oninput="this.form.aRange43.value=this.value" tabindex="-1" />
+
+<input class="range api" type="range" name="aRange43" data-type="int32" data-key="43"
+  onchange="valueChangedHandler(this)"
+ id="f43"
+          min="1" max="100" oninput="this.form.aInput43.value=this.value" />
+      </span>
+    </form>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f46">Operating System</label>
+
+      <select class="api" data-type="uint8" data-key="46" id="f46" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="1">Linux</option>
+
+      <option value="2">MacOS</option>
+
+      <option value="3">Windows</option>
+
+      <option value="4">Android</option>
+
+      <option value="255">Other</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f48">Cursor Park Position</label>
+
+      <select class="api" data-type="uint8" data-key="48" id="f48" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="0">Top</option>
+
+      <option value="1">Bottom</option>
+
+      <option value="3">Previous</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+      </div>
+      <h3 class="sub">Screensaver</h3>
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f49">Mode</label>
+
+      <select class="api" data-type="uint8" data-key="49" id="f49" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="0">Disabled</option>
+
+      <option value="1">Pong</option>
+
+      <option value="2">Jitter</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f50">Only If Inactive</label>
+
+
+<input class="api switch" type="checkbox" name="name50" data-type="uint8" data-key="50"
+  onchange="valueChangedHandler(this)"
+ id="f50" />
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f51">Idle Time (seconds)</label>
+
+
+<input class="api" type="number" name="name51" data-type="uint64" data-key="51" data-scale="1000000"
+
+ id="f51"
+        min="0" max="4294.967295" step="0.000001" aria-describedby="timer-range-51" />
+      <span class="timer-hint" id="timer-range-51">0 to under 4,295 seconds</span>
+      <small class="timer-error" id="timer-error-51" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f52">Max Time (seconds)</label>
+
+
+<input class="api" type="number" name="name52" data-type="uint64" data-key="52" data-scale="1000000"
+
+ id="f52"
+        min="0" max="4294.967295" step="0.000001" aria-describedby="timer-range-52" />
+      <span class="timer-hint" id="timer-range-52">0 = no time limit</span>
+      <small class="timer-error" id="timer-error-52" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+      </div>
+      <h3 class="sub">Key mapping</h3>
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f53">Swap Ctrl and Cmd</label>
+
+
+<input class="api switch" type="checkbox" name="name53" data-type="uint8" data-key="53"
+  onchange="valueChangedHandler(this)"
+ id="f53" />
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row keymap-field" data-keymap-output="1"
+         data-keymap-kind="overrides">
+      <label for="k1overrides">Key overrides</label>
+      <textarea id="k1overrides" class="keymap-text" rows="3" autocomplete="off" spellcheck="false"
+                placeholder="capslock=lctrl"></textarea>
+      <small class="keymap-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row keymap-field" data-keymap-output="1"
+         data-keymap-kind="passthrough">
+      <label for="k1passthrough">Passthrough keys</label>
+      <textarea id="k1passthrough" class="keymap-text" rows="3" autocomplete="off" spellcheck="false"
+                placeholder="capslock, f1"></textarea>
+      <small class="keymap-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+  </div>
+
+        </div>
+
+
+        <details id="advanced">
+          <summary>Advanced</summary>
+
+          <div class="computer" data-computer="A" id="advanced-A">
+
+
+
+
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f11">Screen Count</label>
+
+      <select class="api" data-type="uint32" data-key="11" id="f11" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="1">1</option>
+
+      <option value="2">2</option>
+
+      <option value="3">3</option>
+
+      <option value="4">4</option>
+
+      <option value="5">5</option>
+
+      <option value="6">6</option>
+
+      <option value="7">7</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f14">Legacy seam fallback start (not layout offset)</label>
+
+
+<input class="api" type="text" name="name14" data-type="int32" data-key="14"
+  onchange="valueChangedHandler(this)"
+ id="f14" />
+
+
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f15">Legacy seam fallback end (not layout offset)</label>
+
+
+<input class="api" type="text" name="name15" data-type="int32" data-key="15"
+  onchange="valueChangedHandler(this)"
+ id="f15" />
+
+
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f17">Border Direction</label>
+
+      <select class="api" data-type="uint8" data-key="17" id="f17" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="1">Left</option>
+
+      <option value="2">Right</option>
+
+      <option value="4">Top</option>
+
+      <option value="5">Bottom</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f98">Chain Direction</label>
+
+      <select class="api" data-type="uint8" data-key="98" id="f98" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="1">Left</option>
+
+      <option value="2">Right</option>
+
+      <option value="4">Top</option>
+
+      <option value="5">Bottom</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+      </div>
+      <h3 class="sub">Seam ranges — Start/End show layout offset</h3>
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row seam-range">
+      <span>Segment 1</span>
+      <span class="seam-inputs">
+        <label>Screen
+<input class="api seam-input" type="number" data-type="uint8" data-key="140"
+  min="0" max="7" onchange="valueChangedHandler(this)" />
+</label>
+        <label>Start
+<input class="api seam-input" type="number" data-type="uint16" data-key="141"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+        <label>End
+<input class="api seam-input" type="number" data-type="uint16" data-key="142"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+      </span>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row seam-range">
+      <span>Segment 2</span>
+      <span class="seam-inputs">
+        <label>Screen
+<input class="api seam-input" type="number" data-type="uint8" data-key="143"
+  min="0" max="7" onchange="valueChangedHandler(this)" />
+</label>
+        <label>Start
+<input class="api seam-input" type="number" data-type="uint16" data-key="144"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+        <label>End
+<input class="api seam-input" type="number" data-type="uint16" data-key="145"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+      </span>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row seam-range">
+      <span>Segment 3</span>
+      <span class="seam-inputs">
+        <label>Screen
+<input class="api seam-input" type="number" data-type="uint8" data-key="146"
+  min="0" max="7" onchange="valueChangedHandler(this)" />
+</label>
+        <label>Start
+<input class="api seam-input" type="number" data-type="uint16" data-key="147"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+        <label>End
+<input class="api seam-input" type="number" data-type="uint16" data-key="148"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+      </span>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row seam-range">
+      <span>Segment 4</span>
+      <span class="seam-inputs">
+        <label>Screen
+<input class="api seam-input" type="number" data-type="uint8" data-key="149"
+  min="0" max="7" onchange="valueChangedHandler(this)" />
+</label>
+        <label>Start
+<input class="api seam-input" type="number" data-type="uint16" data-key="150"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+        <label>End
+<input class="api seam-input" type="number" data-type="uint16" data-key="151"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+      </span>
+    </div>
+
+
+
+
+
+  </div>
+
+          </div>
+
+          <div class="computer" data-computer="B" id="advanced-B" hidden>
+
+
+
+
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f41">Screen Count</label>
+
+      <select class="api" data-type="uint32" data-key="41" id="f41" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="1">1</option>
+
+      <option value="2">2</option>
+
+      <option value="3">3</option>
+
+      <option value="4">4</option>
+
+      <option value="5">5</option>
+
+      <option value="6">6</option>
+
+      <option value="7">7</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f44">Legacy seam fallback start (not layout offset)</label>
+
+
+<input class="api" type="text" name="name44" data-type="int32" data-key="44"
+  onchange="valueChangedHandler(this)"
+ id="f44" />
+
+
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f45">Legacy seam fallback end (not layout offset)</label>
+
+
+<input class="api" type="text" name="name45" data-type="int32" data-key="45"
+  onchange="valueChangedHandler(this)"
+ id="f45" />
+
+
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f47">Border Direction</label>
+
+      <select class="api" data-type="uint8" data-key="47" id="f47" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="1">Left</option>
+
+      <option value="2">Right</option>
+
+      <option value="4">Top</option>
+
+      <option value="5">Bottom</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f99">Chain Direction</label>
+
+      <select class="api" data-type="uint8" data-key="99" id="f99" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="1">Left</option>
+
+      <option value="2">Right</option>
+
+      <option value="4">Top</option>
+
+      <option value="5">Bottom</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+      </div>
+      <h3 class="sub">Seam ranges — Start/End show layout offset</h3>
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row seam-range">
+      <span>Segment 1</span>
+      <span class="seam-inputs">
+        <label>Screen
+<input class="api seam-input" type="number" data-type="uint8" data-key="152"
+  min="0" max="7" onchange="valueChangedHandler(this)" />
+</label>
+        <label>Start
+<input class="api seam-input" type="number" data-type="uint16" data-key="153"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+        <label>End
+<input class="api seam-input" type="number" data-type="uint16" data-key="154"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+      </span>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row seam-range">
+      <span>Segment 2</span>
+      <span class="seam-inputs">
+        <label>Screen
+<input class="api seam-input" type="number" data-type="uint8" data-key="155"
+  min="0" max="7" onchange="valueChangedHandler(this)" />
+</label>
+        <label>Start
+<input class="api seam-input" type="number" data-type="uint16" data-key="156"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+        <label>End
+<input class="api seam-input" type="number" data-type="uint16" data-key="157"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+      </span>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row seam-range">
+      <span>Segment 3</span>
+      <span class="seam-inputs">
+        <label>Screen
+<input class="api seam-input" type="number" data-type="uint8" data-key="158"
+  min="0" max="7" onchange="valueChangedHandler(this)" />
+</label>
+        <label>Start
+<input class="api seam-input" type="number" data-type="uint16" data-key="159"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+        <label>End
+<input class="api seam-input" type="number" data-type="uint16" data-key="160"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+      </span>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row seam-range">
+      <span>Segment 4</span>
+      <span class="seam-inputs">
+        <label>Screen
+<input class="api seam-input" type="number" data-type="uint8" data-key="161"
+  min="0" max="7" onchange="valueChangedHandler(this)" />
+</label>
+        <label>Start
+<input class="api seam-input" type="number" data-type="uint16" data-key="162"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+        <label>End
+<input class="api seam-input" type="number" data-type="uint16" data-key="163"
+  min="0" max="65535" onchange="valueChangedHandler(this)" />
+</label>
+      </span>
+    </div>
+
+
+
+
+
+  </div>
+
+          </div>
+
+        </details>
+      </section>
+
+      <section data-section="keyboard" aria-labelledby="keyboard-title" hidden>
+        <h2 id="keyboard-title">Keyboard &amp; Mouse</h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      <h3 class="sub">Mouse</h3>
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f71">Force Mouse Boot Mode</label>
+
+
+<input class="api switch" type="checkbox" name="name71" data-type="uint8" data-key="71"
+  onchange="valueChangedHandler(this)"
+ id="f71" />
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f75">Enable Acceleration</label>
+
+
+<input class="api switch" type="checkbox" name="name75" data-type="uint8" data-key="75"
+  onchange="valueChangedHandler(this)"
+ id="f75" />
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <form class="row">
+
+<label for="f77">Jump Threshold</label>
+
+      <span class="slider">
+
+<input class="readout" type="number" name="aInput77" data-type="uint16" data-key="77"
+  onchange="valueChangedHandler(this)"
+
+          readonly oninput="this.form.aRange77.value=this.value" tabindex="-1" />
+
+<input class="range api" type="range" name="aRange77" data-type="uint16" data-key="77"
+  onchange="valueChangedHandler(this)"
+ id="f77"
+          min="0" max="3000" oninput="this.form.aInput77.value=this.value" />
+      </span>
+    </form>
+
+
+
+
+
+
+      </div>
+      <h3 class="sub">Keyboard</h3>
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f72">Force KBD Boot Protocol</label>
+
+
+<input class="api switch" type="checkbox" name="name72" data-type="uint8" data-key="72"
+  onchange="valueChangedHandler(this)"
+ id="f72" />
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f73">KBD LED as Indicator</label>
+
+
+<input class="api switch" type="checkbox" name="name73" data-type="uint8" data-key="73"
+  onchange="valueChangedHandler(this)"
+ id="f73" />
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f76">Enforce Ports</label>
+
+
+<input class="api switch" type="checkbox" name="name76" data-type="uint8" data-key="76"
+  onchange="valueChangedHandler(this)"
+ id="f76" />
+    </div>
+
+
+
+
+
+
+      </div>
+      <h3 class="sub">Status LED</h3>
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f101">Turn off</label>
+
+      <select class="api" data-type="uint8" data-key="101" id="f101" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="0">Never</option>
+
+      <option value="1">When idle</option>
+
+      <option value="2">After a switch</option>
+
+      </select>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f102">After</label>
+
+      <select class="api" data-type="uint16" data-key="102" id="f102" onchange="redrawLayout()" required>
+      <option disabled selected value></option>
+
+      <option value="5">5 seconds</option>
+
+      <option value="10">10 seconds</option>
+
+      <option value="30">30 seconds</option>
+
+      <option value="60">1 minute</option>
+
+      <option value="300">5 minutes</option>
+
+      <option value="900">15 minutes</option>
+
+      <option value="3600">1 hour</option>
+
+      </select>
+    </div>
+
+
+
+
+
+  </div>
+
+
+        <p class="hint">Any key or mouse move turns it back on. Config mode always blinks.</p>
+      </section>
+
+      <section data-section="hotkeys" aria-labelledby="hotkeys-title" hidden>
+        <h2 id="hotkeys-title">Hotkeys</h2>
+        <p class="hint">Key names joined with +, for example lctrl+rshift+c+o.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="0">
+      <label for="h0">output_toggle</label>
+      <input id="h0" class="hotkey-text" type="text" data-hotkey-key="110"
+             data-action-name="output_toggle" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="1">
+      <label for="h1">mouse_zoom</label>
+      <input id="h1" class="hotkey-text" type="text" data-hotkey-key="112"
+             data-action-name="mouse_zoom" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="2">
+      <label for="h2">switch_lock</label>
+      <input id="h2" class="hotkey-text" type="text" data-hotkey-key="114"
+             data-action-name="switch_lock" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="3">
+      <label for="h3">screen_lock</label>
+      <input id="h3" class="hotkey-text" type="text" data-hotkey-key="116"
+             data-action-name="screen_lock" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="4">
+      <label for="h4">gaming_mode</label>
+      <input id="h4" class="hotkey-text" type="text" data-hotkey-key="118"
+             data-action-name="gaming_mode" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="5">
+      <label for="h5">screensaver_pong</label>
+      <input id="h5" class="hotkey-text" type="text" data-hotkey-key="120"
+             data-action-name="screensaver_pong" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="6">
+      <label for="h6">screensaver_jitter</label>
+      <input id="h6" class="hotkey-text" type="text" data-hotkey-key="122"
+             data-action-name="screensaver_jitter" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="7">
+      <label for="h7">screensaver_disable</label>
+      <input id="h7" class="hotkey-text" type="text" data-hotkey-key="124"
+             data-action-name="screensaver_disable" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="8">
+      <label for="h8">wipe_config</label>
+      <input id="h8" class="hotkey-text" type="text" data-hotkey-key="126"
+             data-action-name="wipe_config" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="9">
+      <label for="h9">screen_seam</label>
+      <input id="h9" class="hotkey-text" type="text" data-hotkey-key="128"
+             data-action-name="screen_seam" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="10">
+      <label for="h10">config_mode</label>
+      <input id="h10" class="hotkey-text" type="text" data-hotkey-key="130"
+             data-action-name="config_mode" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="11">
+      <label for="h11">firmware_upgrade_a</label>
+      <input id="h11" class="hotkey-text" type="text" data-hotkey-key="132"
+             data-action-name="firmware_upgrade_a" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row hotkey-field" data-hotkey-action="12">
+      <label for="h12">firmware_upgrade_b</label>
+      <input id="h12" class="hotkey-text" type="text" data-hotkey-key="134"
+             data-action-name="firmware_upgrade_b" autocomplete="off" spellcheck="false" />
+      <small class="hotkey-error" aria-live="polite"></small>
+    </div>
+
+
+
+
+
+  </div>
+
+
+      </section>
+
+      <section data-section="clipboard" aria-labelledby="clipboard-title" hidden>
+        <h2 id="clipboard-title">Clipboard</h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f89">Block clipboard A to B</label>
+
+
+<input class="api switch" type="checkbox" name="name89" data-type="uint8" data-key="89"
+  onchange="valueChangedHandler(this)"
+ id="f89" />
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <div class="row">
+
+<label for="f90">Block clipboard B to A</label>
+
+
+<input class="api switch" type="checkbox" name="name90" data-type="uint8" data-key="90"
+  onchange="valueChangedHandler(this)"
+ id="f90" />
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <form class="row">
+
+<label for="f100">Clipboard size cap (MB)</label>
+
+      <span class="slider">
+
+<input class="readout" type="number" name="aInput100" data-type="uint8" data-key="100"
+  onchange="valueChangedHandler(this)"
+
+          readonly oninput="this.form.aRange100.value=this.value" tabindex="-1" />
+
+<input class="range api" type="range" name="aRange100" data-type="uint8" data-key="100"
+  onchange="valueChangedHandler(this)"
+ id="f100"
+          min="1" max="64" oninput="this.form.aInput100.value=this.value" />
+      </span>
+    </form>
+
+
+
+
+
+  </div>
+
+
+      </section>
+
+      <section data-section="status" aria-labelledby="status-title" hidden>
+        <h2 id="status-title">Status</h2>
+
+
+
+
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f78">This board FW version</label>
+
+
+<input class="api" type="text" name="name78" data-type="uint16" data-key="78"
+  onchange="valueChangedHandler(this)"
+ id="f78" data-fw-ver readonly />
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f84">Other board FW version</label>
+
+
+<input class="api" type="text" name="name84" data-type="uint16" data-key="84"
+  onchange="valueChangedHandler(this)"
+ id="f84" data-peer-fw-ver readonly />
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f79">Running FW checksum</label>
+
+
+<input class="api content" type="text" name="name79" data-type="uint32" data-key="79"
+  onchange="valueChangedHandler(this)"
+ id="f79" data-hex readonly />
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f85">Other board FW checksum</label>
+
+
+<input class="api content" type="text" name="name85" data-type="uint32" data-key="85"
+  onchange="valueChangedHandler(this)"
+ id="f85" data-peer-fw-crc readonly />
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f83">Build</label>
+
+
+<input class="api" type="text" name="name83" data-type="uint8" data-key="83"
+  onchange="valueChangedHandler(this)"
+ id="f83" data-dev-build readonly />
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<input class="api" type="hidden" name="name86" data-type="uint32" data-key="86"
+  onchange="valueChangedHandler(this)"
+ data-helper-key-lo readonly />
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<input class="api" type="hidden" name="name87" data-type="uint32" data-key="87"
+  onchange="valueChangedHandler(this)"
+ data-helper-key-hi readonly />
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f88">Paired helper</label>
+
+
+<input class="api content" type="text" name="name88" data-type="uint8" data-key="88"
+  onchange="valueChangedHandler(this)"
+ id="f88" data-helper-paired readonly />
+</div>
+
+
+
+
+
+
+
+      </div>
+      <h3 class="sub">Channel drops (since this boot)</h3>
+      <div class="group">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f91">Reports not taken</label>
+
+
+<input class="api content" type="text" name="name91" data-type="uint32" data-key="91"
+  onchange="valueChangedHandler(this)"
+ id="f91" data-hex readonly />
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f92">From peer board</label>
+
+
+<input class="api content" type="text" name="name92" data-type="uint32" data-key="92"
+  onchange="valueChangedHandler(this)"
+ id="f92" data-hex readonly />
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f93">Outbound refused</label>
+
+
+<input class="api content" type="text" name="name93" data-type="uint32" data-key="93"
+  onchange="valueChangedHandler(this)"
+ id="f93" data-hex readonly />
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f94">Inter-board refused</label>
+
+
+<input class="api content" type="text" name="name94" data-type="uint32" data-key="94"
+  onchange="valueChangedHandler(this)"
+ id="f94" data-hex readonly />
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f95">Peer orphan packets</label>
+
+
+<input class="api content" type="text" name="name95" data-type="uint32" data-key="95"
+  onchange="valueChangedHandler(this)"
+ id="f95" data-hex readonly />
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f96">Peer frames truncated</label>
+
+
+<input class="api content" type="text" name="name96" data-type="uint32" data-key="96"
+  onchange="valueChangedHandler(this)"
+ id="f96" data-hex readonly />
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="row">
+
+<label for="f97">Relay queue refused</label>
+
+
+<input class="api content" type="text" name="name97" data-type="uint32" data-key="97"
+  onchange="valueChangedHandler(this)"
+ id="f97" data-hex readonly />
+</div>
+
+
+
+
+
+
+  </div>
+
+        <h3>Cursor transition trace</h3>
+        <div class="group">
+          <div class="row"><button type="button" class="online" onclick="readCursorTraceHandler()">Read trace</button></div>
+          <pre id="cursorTrace">No trace read.</pre>
+        </div>
+      </section>
+
+      <section data-section="service" aria-labelledby="service-title" hidden>
+        <h2 id="service-title">Service</h2>
+        <div class="group" id="service-buttons">
+          <div class="row"><span>Blink this board's LED</span><button type="button" class="online" data-handler="blinkHandler">Blink</button></div>
+          <div class="row"><span>Blink both boards' LEDs</span><button type="button" class="online" data-handler="blinkBothHandler">Blink both</button></div>
+          <div class="row"><span>Reboot into the bootloader for a firmware upgrade</span><button type="button" class="online" data-handler="enterBootloaderHandler" data-arm="Click again to reboot">Bootloader</button></div>
+          <div class="row"><span>Erase every setting and the helper pairing</span><button type="button" class="online" data-handler="wipeConfigHandler" data-arm="Click again to wipe">Wipe Config</button></div>
+        </div>
+      </section>
+      </fieldset>
+    </main>
+  </div>
+</div>
+
+  <script>
+  const mgmtReportId = 6;
+var device;
+
+const packetType = {
+  keyboardReportMsg: 1, mouseReportMsg: 2, outputSelectMsg: 3, firmwareUpgradeMsg: 4, switchLockMsg: 7,
+  syncBordersMsg: 8, flashLedMsg: 9, wipeConfigMsg: 10, readConfigMsg: 16, writeConfigMsg: 17, saveConfigMsg: 18,
+  rebootMsg: 19, getValMsg: 20, setValMsg: 21, getValAllMsg: 22, proxyPacketMsg: 23,
+  getCursorTraceMsg: 33, cursorTraceMsg: 34
+};
+
+/* boot: q bit0 into config mode, bit1 watchdog reset, bit2 meant (bit1 without bit2 = hang).
+   hid-mount/unmount (#102): q=dev_addr d=(instance,protocol);
+   mount dir bit0 keyboard seen, bit1 mouse seen; transition 1 polling, 2 refused, 3 rejected.
+   dev-mount/unmount: q=dev_addr, the device before any class driver. replug: q=pulls so far. */
+const cursorTraceEvents = ["", "input", "decision", "query", "response", "place", "switch", "cancel", "timeout", "boot", "hid-mount", "hid-unmount", "dev-mount", "dev-unmount", "replug"];
+const cursorTraceState = { output: 0, screen: 1, direction: 4, phase: 7, relative: 10, transition: 11 };
+let cursorTraceParts = new Map();
+
+function calcChecksum(report) {
+  let checksum = 0;
+  for (let i = 3; i < 11; i++)
+    checksum ^= report[i];
+
+  return checksum;
+}
+
+async function sendReport(type, payload = [], sendBoth = false) {
+  if (!device || !device.opened)
+    return;
+
+  /* First send this one, if the first one gets e.g. rebooted */
+  if (sendBoth) {
+    var reportProxy = makeReport(type, payload, true);
+    await device.sendReport(mgmtReportId, reportProxy);
+    }
+
+    var report = makeReport(type, payload, false);
+    await device.sendReport(mgmtReportId, report);
+}
+
+function makeReport(type, payload, proxy=false) {
+  var dataOffset = proxy ? 4 : 3;
+  report = new Uint8Array([0xaa, 0x55, type, ...new Array(9).fill(0)]);
+
+  if (proxy)
+    report = new Uint8Array([0xaa, 0x55, packetType.proxyPacketMsg, type, ...new Array(7).fill(0), type]);
+
+  if (payload) {
+    report.set([...payload], dataOffset);
+    report[report.length - 1] = calcChecksum(report);
+  }
+  return report;
+}
+
+function scaleOf(element) {
+  return Number(element.getAttribute('data-scale')) || 1;
+}
+
+function timerValid(element) {
+  if (!element.hasAttribute('data-scale') || element.checkValidity()) return true;
+  element.closest('.row').querySelector('small').textContent =
+    'Enter 0–4294.967295 seconds, with up to six decimal places.';
+  element.reportValidity();
+  return false;
+}
+
+function packValue(element, key, dataType, buffer) {
+  const dataOffset = 1;
+  var buffer = new ArrayBuffer(8);
+  var view = new DataView(buffer);
+
+  const methods = {
+    "uint32": view.setUint32,
+    "uint64": view.setUint32, /* Yes, I know. :-| */
+    "int32": view.setInt32,
+    "uint16": view.setUint16,
+    "uint8": view.setUint8,
+    "int16": view.setInt16,
+    "int8": view.setInt8
+  };
+
+  if (dataType in methods) {
+    const method = methods[dataType];
+    if (element.type === 'checkbox')
+      view.setUint8(dataOffset, element.checked ? 1 : 0, true);
+    else
+      method.call(view, dataOffset,
+                  scaleOf(element) === 1 ? element.value : Math.round(element.value * scaleOf(element)), true);
+  }
+
+  view.setUint8(0, key);
+  return new Uint8Array(buffer);
+}
+
+window.addEventListener('load', function () {
+  if (!("hid" in navigator)) {
+    document.getElementById('warning').hidden = false;
+  }
+});
+
+async function connectHandler() {
+  if (device && device.opened)
+    return;
+
+  var devices = await navigator.hid.requestDevice({
+    filters: [{ vendorId: 0x1209, productId: 0xd35c, usagePage: 0xff00, usage: 0x10 }]
+  });
+
+  /* No board chosen: the prompt was cancelled or listed nothing. */
+  if (!devices.length)
+    throw Error('No board chosen.');
+
+  device = devices[0];
+  await device.open();
+  device.addEventListener('inputreport', handleInputReport);
+  setConnected(true);
+  await readHandler();
+}
+
+async function blinkHandler() {
+  await sendReport(packetType.flashLedMsg, []);
+}
+
+async function blinkBothHandler() {
+  await sendReport(packetType.flashLedMsg, [], true);
+}
+
+function getValue(element) {
+  if (element.type === 'checkbox')
+    return element.checked ? 1 : 0;
+  else
+    return element.value;
+}
+
+function setValue(element, value) {
+  element.setAttribute('fetched-value', value);
+
+  /* A stored value the list lacks (a hand-built config) is shown as its
+     number, not as a blank that Save would then overwrite (#283). */
+  if (element.tagName === 'SELECT' && ![...element.options].some(o => o.value == value))
+    element.add(new Option(String(value), value));
+
+  if (element.type === 'checkbox')
+    element.checked = value;
+  else
+    element.value = value;
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+
+function updateElement(key, event) {
+  var dataOffset = 4;
+
+  if ((key >= 24 && key < 24 + 12) || (key >= 54 && key < 54 + 12)) {
+    updateKeymapChunk(key, event);
+    return;
+  }
+
+  var element = document.querySelector(`[data-key="${key}"]`);
+
+  if (key >= 110 && key < 136) {
+    updateHotkeyChunk(key, event);
+    return;
+  }
+
+  if (!element)
+    return;
+
+  const methods = {
+    "uint32": event.data.getUint32,
+    "uint64": event.data.getUint32, /* Yes, I know. :-| */
+    "int32": event.data.getInt32,
+    "uint16": event.data.getUint16,
+    "uint8": event.data.getUint8,
+    "int16": event.data.getInt16,
+    "int8": event.data.getInt8
+  };
+
+  /* u16 version = major * 1000 + minor + 100; */
+  const formatVersion = (value) =>
+    `v${Math.floor((value - 100) / 1000)}.${(value - 100) % 1000}`;
+
+  dataType = element.getAttribute('data-type');
+
+  if (dataType in methods) {
+    var value = methods[dataType].call(event.data, dataOffset, true) / scaleOf(element);
+    setValue(element, value);
+
+    if (element.hasAttribute('data-hex'))
+      setValue(element, parseInt(value).toString(16));
+
+    if (element.hasAttribute('data-fw-ver'))
+      setValue(element, formatVersion(value));
+
+    /* The other board, as heard from its heartbeats. Zero means none has been
+       heard from — unplugged, or the inter-board link is down — and that is an
+       absence, not a version: formatVersion would render it as v-1.-100. */
+    if (element.hasAttribute('data-peer-fw-ver'))
+      setValue(element, value ? formatVersion(value) : 'not detected');
+
+    /* The other board's image checksum. Compare it with the running checksum
+       above to tell a synced pair from an unsynced one -- since #91 the two
+       versions can agree while the images do not. Zero is an absence here for
+       the same reason as the version, and the firmware clears both together. */
+    if (element.hasAttribute('data-peer-fw-crc'))
+      setValue(element, value ? parseInt(value).toString(16) : 'not detected');
+
+    /* The paired helper's key id (#114). It arrives in three pieces and any
+       of them can be the last to land, so the whole line is redrawn each
+       time rather than assuming the map's order. */
+    if (element.hasAttribute('data-helper-paired') || element.hasAttribute('data-helper-key-lo')
+        || element.hasAttribute('data-helper-key-hi'))
+      renderPairedHelper();
+
+    if (element.hasAttribute('data-dev-build')) {
+      setValue(element, value ? 'development — channel authentication is disabled' : 'release');
+      if (value) {
+        element.classList.add('dev-warning');
+        /* Field 83 arrives after 78 (map order), so the version is rendered by now */
+        const ver = document.querySelector('[data-fw-ver]');
+        if (ver && ver.value && !ver.value.endsWith('-dev'))
+          setValue(ver, `${ver.value}-dev`);
+      }
+    }
+  }
+}
+
+const hotkeyBytes = Array.from({length: 13}, () => ({bytes: new Uint8Array(9), mask: 0}));
+const namedKeyUsages = {"enter":40,"esc":41,"backspace":42,"tab":43,"space":44,"minus":45,"equals":46,"lbracket":47,"rbracket":48,"backslash":49,"semicolon":51,"quote":52,"grave":53,"comma":54,"period":55,"slash":56,"capslock":57,"printscreen":70,"scrolllock":71,"insert":73,"home":74,"pageup":75,"delete":76,"end":77,"pagedown":78,"right":79,"left":80,"down":81,"up":82,"numlock":83,"kp_divide":84,"kp_multiply":85,"kp_minus":86,"kp_plus":87,"kp_enter":88,"kp1":89,"kp2":90,"kp3":91,"kp4":92,"kp5":93,"kp6":94,"kp7":95,"kp8":96,"kp9":97,"kp0":98,"kp_period":99,"lctrl":224,"lshift":225,"lalt":226,"lgui":227,"rctrl":228,"rshift":229,"ralt":230,"rgui":231};
+for (let i=0; i<26; ++i) namedKeyUsages[String.fromCharCode(97+i)] = 0x04+i;
+for (let i=1; i<=9; ++i) namedKeyUsages[String(i)] = 0x1d+i;
+namedKeyUsages['0'] = 0x27;
+for (let i=1; i<=12; ++i) namedKeyUsages[`f${i}`] = 0x39+i;
+const usageNames = Object.fromEntries(Object.entries(namedKeyUsages).map(([name, usage]) => [usage, name]));
+
+const keymapProfileBytes = 82;
+const keymapChunkSize = 7;
+const keymapChunkCount = 12;
+const keymapProfiles = [24, 54].map(base => ({base, bytes: new Uint8Array(keymapProfileBytes), mask: 0}));
+
+function keymapInput(output, kind) {
+  return document.querySelector(`[data-keymap-output="${output}"][data-keymap-kind="${kind}"] .keymap-text`);
+}
+
+function updateKeymapChunk(key, event) {
+  const output = key >= keymapProfiles[1].base ? 1 : 0;
+  const entry = keymapProfiles[output];
+  const part = key - entry.base;
+  const length = Math.min(keymapChunkSize, keymapProfileBytes - part*keymapChunkSize);
+  for (let i=0; i<length; ++i) entry.bytes[part*keymapChunkSize+i] = event.data.getUint8(4+i);
+  entry.mask |= 1 << part;
+  if (entry.mask !== (1 << keymapChunkCount) - 1) return;
+
+  const overrideCount = entry.bytes[64];
+  const passthroughCount = entry.bytes[81];
+  const overrides = keymapInput(output, 'overrides');
+  const passthrough = keymapInput(output, 'passthrough');
+  const error = overrides.parentElement.querySelector('.keymap-error');
+  if (overrideCount > 32 || passthroughCount > 16) {
+    error.textContent = 'Stored profile is invalid; Save will replace it.';
+    overrides.value = 'invalid';
+    passthrough.value = 'invalid';
+    return;
+  }
+  const shownOverrides = [];
+  for (let i=0; i<overrideCount; ++i)
+    shownOverrides.push(`${usageNames[entry.bytes[2*i]] || `unknown_${entry.bytes[2*i]}`}=${usageNames[entry.bytes[2*i+1]] || `unknown_${entry.bytes[2*i+1]}`}`);
+  const shownPassthrough = [];
+  for (let i=0; i<passthroughCount; ++i)
+    shownPassthrough.push(usageNames[entry.bytes[65+i]] || `unknown_${entry.bytes[65+i]}`);
+  overrides.value = shownOverrides.join('\n');
+  passthrough.value = shownPassthrough.join(', ');
+  overrides.setAttribute('fetched-value', overrides.value);
+  passthrough.setAttribute('fetched-value', passthrough.value);
+}
+
+function keymapError(line, column, token, message) {
+  return {error: {line, column, token, message}};
+}
+
+function parseOverrides(input) {
+  const parsed = [];
+  const lines = input.value.split('\n');
+  for (let lineIndex=0; lineIndex<lines.length; ++lineIndex) {
+    const line = lines[lineIndex];
+    if (!line.trim()) continue;
+    const equals = line.indexOf('=');
+    if (equals < 0)
+      return keymapError(lineIndex+1, line.length+1, line.trim(), 'expected “=”');
+    const from = line.slice(0, equals).trim().toLowerCase();
+    const to = line.slice(equals+1).trim().toLowerCase();
+    if (!from || !to)
+      return keymapError(lineIndex+1, equals+2, '', 'expected a key name');
+    if (to.includes('='))
+      return keymapError(lineIndex+1, equals+2+to.indexOf('='), '=', 'expected one mapping per line');
+    if (!(from in namedKeyUsages))
+      return keymapError(lineIndex+1, line.toLowerCase().indexOf(from)+1, from, 'unknown key name');
+    if (!(to in namedKeyUsages))
+      return keymapError(lineIndex+1, line.toLowerCase().indexOf(to, equals+1)+1, to, 'unknown key name');
+    if (parsed.length >= 32)
+      return keymapError(lineIndex+1, 1, from, 'profile exceeds the 32-override capacity');
+    parsed.push([namedKeyUsages[from], namedKeyUsages[to]]);
+  }
+  return {parsed};
+}
+
+function parsePassthrough(input) {
+  const parsed = [];
+  const lines = input.value.split('\n');
+  for (let lineIndex=0; lineIndex<lines.length; ++lineIndex) {
+    if (!lines[lineIndex].trim()) continue;
+    const rawTokens = lines[lineIndex].split(',');
+    for (const raw of rawTokens) {
+      const token = raw.trim().toLowerCase();
+      if (!token)
+        return keymapError(lineIndex+1, Math.max(1, lines[lineIndex].indexOf(raw)+1), '', 'expected a key name');
+      if (!(token in namedKeyUsages))
+        return keymapError(lineIndex+1, lines[lineIndex].toLowerCase().indexOf(token)+1, token, 'unknown key name');
+      if (parsed.length >= 16)
+        return keymapError(lineIndex+1, lines[lineIndex].toLowerCase().indexOf(token)+1, token, 'profile exceeds the 16-key capacity');
+      parsed.push(namedKeyUsages[token]);
+    }
+  }
+  return {parsed};
+}
+
+function showKeymapError(input, result) {
+  const shown = input.parentElement.querySelector('.keymap-error');
+  shown.textContent = result.error ? `Line ${result.error.line}, column ${result.error.column}, token “${result.error.token}”: ${result.error.message}` : '';
+}
+
+/* Parses both outputs' profiles and shows their errors. With send false it
+   stops there, so Save can check every field before it sends any. */
+async function saveKeymaps(send = true) {
+  const parsed = [];
+  let valid = true;
+  for (let output=0; output<2; ++output) {
+    const overrides = keymapInput(output, 'overrides');
+    const passthrough = keymapInput(output, 'passthrough');
+    const overrideResult = parseOverrides(overrides);
+    const passthroughResult = parsePassthrough(passthrough);
+    showKeymapError(overrides, overrideResult);
+    showKeymapError(passthrough, passthroughResult);
+    valid = valid && !overrideResult.error && !passthroughResult.error;
+    parsed.push({overrides, passthrough, overrideResult, passthroughResult});
+  }
+  if (!valid || !send) return valid;
+
+  for (let output=0; output<2; ++output) {
+    const item = parsed[output];
+    if (item.overrides.getAttribute('fetched-value') === item.overrides.value &&
+        item.passthrough.getAttribute('fetched-value') === item.passthrough.value) continue;
+    const bytes = new Uint8Array(keymapProfileBytes);
+    item.overrideResult.parsed.forEach((mapping, i) => { bytes[2*i] = mapping[0]; bytes[2*i+1] = mapping[1]; });
+    bytes[64] = item.overrideResult.parsed.length;
+    item.passthroughResult.parsed.forEach((usage, i) => { bytes[65+i] = usage; });
+    bytes[81] = item.passthroughResult.parsed.length;
+    for (let part=0; part<keymapChunkCount; ++part)
+      await sendReport(packetType.setValMsg, [keymapProfiles[output].base+part, ...bytes.slice(part*keymapChunkSize, Math.min((part+1)*keymapChunkSize, bytes.length))], true);
+    item.overrides.setAttribute('fetched-value', item.overrides.value);
+    item.passthrough.setAttribute('fetched-value', item.passthrough.value);
+  }
+  return true;
+}
+
+function updateHotkeyChunk(key, event) {
+  const action = Math.floor((key - 110) / 2);
+  const part = (key - 110) % 2;
+  const entry = hotkeyBytes[action];
+  const length = part ? 3 : 6;
+  const offset = part ? 6 : 0;
+  for (let i=0; i<length; ++i) entry.bytes[offset+i] = event.data.getUint8(4+i);
+  entry.mask |= 1 << part;
+  if (entry.mask !== 3) return;
+  const input = document.querySelector(`[data-hotkey-action="${action}"] .hotkey-text`);
+  const error = input.parentElement.querySelector('.hotkey-error');
+  if (entry.bytes[8] !== action || entry.bytes[7] > 6) {
+    error.textContent = 'Stored binding is invalid; Save will replace it.';
+    input.value = 'invalid';
+    return;
+  }
+  const names = [];
+  for (let bit=0; bit<8; ++bit) if (entry.bytes[0] & (1 << bit)) names.push(usageNames[0xe0+bit]);
+  for (let i=0; i<entry.bytes[7]; ++i) names.push(usageNames[entry.bytes[1+i]] || `unknown_${entry.bytes[1+i]}`);
+  input.value = names.join('+');
+  input.setAttribute('fetched-value', input.value);
+}
+
+function parseHotkey(input, action) {
+  const rawTokens = input.value.split('+');
+  const tokens = rawTokens.map(token => token.trim().toLowerCase());
+  if (!input.value.trim() || tokens.some(token => !token))
+    return {error: {line:1, column:1, token: tokens.find(token => !token) || '', message:'expected a key name'}};
+  if (tokens.length > 6)
+    return {error: {line:1, column:input.value.indexOf(rawTokens[6])+1, token:tokens[6], message:'chord exceeds the 6-key capacity'}};
+  const usages = [];
+  for (const token of tokens) {
+    if (!(token in namedKeyUsages))
+      return {error:{line:1, column:input.value.toLowerCase().indexOf(token)+1, token, message:'unknown key name'}};
+    usages.push(namedKeyUsages[token]);
+  }
+  const bytes = new Uint8Array(9);
+  let keyCount = 0;
+  for (const usage of usages) {
+    if (usage >= 0xe0 && usage <= 0xe7) bytes[0] |= 1 << (usage - 0xe0);
+    else bytes[1 + keyCount++] = usage;
+  }
+  bytes[7] = keyCount;
+  bytes[8] = action;
+  return {bytes};
+}
+
+/* Parses every chord and shows its error; send false checks without sending. */
+async function saveHotkeys(send = true) {
+  const inputs = [...document.querySelectorAll('.hotkey-text')];
+  const parsed = inputs.map((input, action) => parseHotkey(input, action));
+  let valid = true;
+  parsed.forEach((result, action) => {
+    const error = inputs[action].parentElement.querySelector('.hotkey-error');
+    error.textContent = result.error ? `Line ${result.error.line}, column ${result.error.column}, token “${result.error.token}”: ${result.error.message}` : '';
+    valid = valid && !result.error;
+  });
+  if (!valid || !send) return valid;
+  for (let action=0; action<parsed.length; ++action) {
+    const input = inputs[action];
+    if (input.getAttribute('fetched-value') === input.value) continue;
+    const bytes = parsed[action].bytes;
+    await sendReport(packetType.setValMsg, [110+2*action, ...bytes.slice(0,6)], true);
+    await sendReport(packetType.setValMsg, [111+2*action, ...bytes.slice(6)], true);
+    input.setAttribute('fetched-value', input.value);
+  }
+  return true;
+}
+
+/* The key id the paired helper's hellos carry, as eight bytes of hex — the
+   same order and spelling the helper writes into its own log, so the two can
+   be compared by eye. Each half arrives as a little-endian u32, so the bytes
+   come out lowest first. */
+function renderPairedHelper() {
+  const shown = document.querySelector('[data-helper-paired]');
+  const lo = document.querySelector('[data-helper-key-lo]');
+  const hi = document.querySelector('[data-helper-key-hi]');
+
+  if (!shown || !lo || !hi)
+    return;
+
+  const paired = shown.getAttribute('fetched-value');
+
+  /* Nothing registered: the halves are zeros and mean nothing, so say so
+     rather than showing sixteen noughts as if they were a key. */
+  if (paired === null || parseInt(paired) === 0) {
+    if (paired !== null)
+      shown.value = 'none — press the Pair chord (Left Ctrl + Right Shift + P)';
+    return;
+  }
+
+  if (lo.value === '' || hi.value === '')
+    return;
+
+  const bytes = (word) => {
+    const n = parseInt(word) >>> 0;
+    return [n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff]
+      .map(b => b.toString(16).padStart(2, '0')).join('');
+  };
+
+  shown.value = bytes(lo.value) + bytes(hi.value);
+}
+
+async function readHandler() {
+  if (!device || !device.opened)
+    await connectHandler();
+
+  await sendReport(packetType.getValAllMsg);
+}
+
+async function handleInputReport(event) {
+  var data = new Uint8Array(event.data.buffer);
+  if (data[2] === packetType.cursorTraceMsg) {
+    handleCursorTraceReport(data);
+    return;
+  }
+  var key = data[3];
+
+  updateElement(key, event);
+  redrawLayout();
+}
+
+function signed16(lo, hi) {
+  const value = lo | (hi << 8);
+  return value & 0x8000 ? value - 0x10000 : value;
+}
+
+function renderCursorTraceRecord(index, bytes) {
+  const state = bytes[10] | (bytes[11] << 8);
+  const output = (state >> cursorTraceState.output) & 1 ? "B" : "A";
+  const screen = (state >> cursorTraceState.screen) & 7;
+  const direction = (state >> cursorTraceState.direction) & 7;
+  const phase = (state >> cursorTraceState.phase) & 7;
+  const relative = (state >> cursorTraceState.relative) & 1;
+  const transition = (state >> cursorTraceState.transition) & 3;
+  return `${index}: ${cursorTraceEvents[bytes[0]] || "unknown"} q=${bytes[1]} ` +
+    `d=(${signed16(bytes[2], bytes[3])},${signed16(bytes[4], bytes[5])}) ` +
+    `p=(${signed16(bytes[6], bytes[7])},${signed16(bytes[8], bytes[9])}) ` +
+    `out=${output} screen=${screen} dir=${direction} transition=${transition} phase=${phase} relative=${relative}`;
+}
+
+async function handleCursorTraceReport(data) {
+  const index = data[3];
+  if (index === 0xff) {
+    const count = data[4];
+    cursorTraceParts.clear();
+    document.getElementById('cursorTrace').textContent = count ? "Reading trace…" : "Trace is empty.";
+    for (let i = 0; i < count; i++) {
+      await sendReport(packetType.getCursorTraceMsg, [i, 0]);
+      await sendReport(packetType.getCursorTraceMsg, [i, 1]);
+    }
+    return;
+  }
+  const half = data[4];
+  const parts = cursorTraceParts.get(index) || [];
+  parts[half] = Array.from(data.slice(5, 11));
+  cursorTraceParts.set(index, parts);
+  if (parts[0] && parts[1]) {
+    const lines = Array.from(cursorTraceParts.entries())
+      .filter(([, value]) => value[0] && value[1])
+      .sort(([a], [b]) => a - b)
+      .map(([i, value]) => renderCursorTraceRecord(i, [...value[0], ...value[1]]));
+    document.getElementById('cursorTrace').textContent = lines.join('\n');
+  }
+}
+
+async function readCursorTraceHandler() {
+  if (!device || !device.opened)
+    await connectHandler();
+  await sendReport(packetType.getCursorTraceMsg, [0xff, 0]);
+}
+
+async function rebootHandler() {
+  await sendReport(packetType.rebootMsg);
+}
+
+async function enterBootloaderHandler() {
+  await sendReport(packetType.firmwareUpgradeMsg, true, true);
+}
+
+async function valueChangedHandler(element) {
+  if (!timerValid(element)) return false;
+  redrawLayout();
+  var key = element.getAttribute('data-key');
+  var dataType = element.getAttribute('data-type');
+
+  var origValue = element.getAttribute('fetched-value');
+  var newValue = getValue(element);
+
+  if (origValue != newValue) {
+    uintBuffer = packValue(element, key, dataType);
+
+    /* Send to both devices */
+    await sendReport(packetType.setValMsg, uintBuffer, true);
+
+    /* Set this as the current value */
+    element.setAttribute('fetched-value', newValue);
+  }
+}
+
+async function saveHandler() {
+  const elements = document.querySelectorAll('.api');
+
+  if (!device || !device.opened)
+    return;
+
+  const invalidTimer = [...elements].find(element =>
+    element.hasAttribute('data-scale') && !element.checkValidity());
+  if (invalidTimer) {
+    revealField(invalidTimer);
+    timerValid(invalidTimer);
+    return false;
+  }
+
+  /* Every field is checked before anything is sent, so a refused Save has
+     sent nothing (#225). Both checks run so every error is shown at once. */
+  const hotkeysValid = await saveHotkeys(false), keymapsValid = await saveKeymaps(false);
+  if (!hotkeysValid || !keymapsValid)
+    return false;
+
+  await saveHotkeys();
+  await saveKeymaps();
+
+  for (const element of elements) {
+    var origValue = element.getAttribute('fetched-value')
+
+    if (element.hasAttribute('readonly'))
+      continue;
+
+    if (origValue != getValue(element))
+      await valueChangedHandler(element);
+  }
+  await sendReport(packetType.saveConfigMsg, [], true);
+  return true;
+}
+
+async function wipeConfigHandler() {
+  await sendReport(packetType.wipeConfigMsg, [], true);
+}
+
+// Coordinates are monitor widths; half-widths are the layout grid.
+// Directions are the board's: 1 Left, 2 Right, 4 Top, 5 Bottom.
+const vectors = {1:[-1,0], 2:[1,0], 4:[0,-1], 5:[0,1]};
+const opposite = {1:2, 2:1, 4:5, 5:4};
+const at = (m, axis) => axis ? m.y : m.x;
+
+function layoutFromFields(fields) {
+  const border = Number(fields[17]) || 2;
+  const normal = vectors[border] || vectors[2];
+  const tangent = normal[0] ? 1 : 0;
+  const outputs = [0,1].map(i => {
+    const base = i ? 40 : 10;
+    const chain = Number(fields[98+i]) || 2;
+    const direction = vectors[chain] || vectors[2];
+    const count = Math.max(1, Math.min(7, Number(fields[base+1]) || 1));
+    const monitors = Array.from({length:count}, (_, n) => ({
+      number:n+1, x:n*direction[0], y:n*direction[1],
+    }));
+    const minX = Math.min(...monitors.map(m => m.x));
+    const minY = Math.min(...monitors.map(m => m.y));
+    monitors.forEach(m => {m.x -= minX; m.y -= minY;});
+    return {letter:i ? 'B' : 'A', os:({1:'Linux',2:'MacOS',3:'Windows',4:'Android',255:'Other'})[fields[base+6]] || 'Other',
+      chain, border:Number(fields[base+7]) || opposite[border], monitors};
+  });
+  const segments = Array.from({length:4}, (_, n) => [140,152].map(base => ({
+    monitor:Number(fields[base+3*n]) || 0,
+    start:Number(fields[base+3*n+1]) || 0, end:Number(fields[base+3*n+2]) || 0,
+  })));
+  const empty = segments.every(pair => pair.every(s => !s.monitor));
+  let custom = !vectors[border] || outputs[1].border !== opposite[border] ||
+    outputs.some(o => o.monitors.length > 1 && o.chain === o.border);
+  const a = outputs[0].monitors, b = outputs[1].monitors;
+  // Start with left/top-aligned lines on the side selected by Output A.
+  let shift = normal.map((v, axis) => v > 0 ? Math.max(...a.map(m => at(m, axis)))+1 :
+    v < 0 ? -Math.max(...b.map(m => at(m, axis)))-1 : 0);
+  const edge = (m, side, fraction) => [m.x, m.y].map((v, axis) =>
+    v + (axis === tangent ? fraction : (side[axis] > 0 ? 1 : 0)));
+  const close = (x,y) => Math.abs(x-y) <= 1/65535;
+  let recovered = false;
+  const bands = [];
+  segments.forEach((pair, index) => {
+    if (pair.every(s => !s.monitor)) return;
+    if (pair.some((s,i) => !Number.isInteger(s.monitor) || s.monitor < 1 ||
+        s.monitor > outputs[i].monitors.length || s.start < 0 || s.end > 65535 || s.start >= s.end)) {
+      custom = true; return;
+    }
+    const points = pair.map((s,i) => [s.start,s.end].map(value =>
+      edge(outputs[i].monitors[s.monitor-1], normal.map(v => i ? -v : v), value/65535)));
+    const delta = points[0][0].map((v,axis) => v-points[1][0][axis]);
+    const snapped = delta.map(v => Math.round(v*2)/2);
+    const valid = delta.every((v,axis) => close(v,snapped[axis]) &&
+      close(points[0][1][axis]-points[1][1][axis],snapped[axis])) &&
+      pair.every(s => [s.start,s.end].every(v => close(v/65535, Math.round(v/65535*2)/2)));
+    const origins = pair.map((s,i) => {
+      const m = outputs[i].monitors[s.monitor-1];
+      return at(m, tangent) + (i ? snapped[tangent] : 0);
+    });
+    const overlapStart = Math.max(...origins), overlapEnd = Math.min(...origins)+1;
+    const collides = a.some(m => b.some(n =>
+      Math.abs(m.x-n.x-snapped[0])<1 && Math.abs(m.y-n.y-snapped[1])<1));
+    if (!valid || collides || !close(points[0][0][tangent], overlapStart) ||
+        !close(points[0][1][tangent], overlapEnd)) {custom = true; return;}
+    if (!recovered) {shift = snapped; recovered = true;}
+    if (!snapped.every((v,axis) => close(v,shift[axis]))) {custom = true; return;}
+    bands.push({number:index+1, start:points[0][0], end:points[0][1]});
+  });
+  b.forEach(m => {m.x += shift[0]; m.y += shift[1];});
+  if (a.some(m => b.some(n => Math.abs(m.x-n.x)<1 && Math.abs(m.y-n.y)<1))) custom = true;
+  const minX = Math.min(...a.concat(b).map(m => m.x));
+  const minY = Math.min(...a.concat(b).map(m => m.y));
+  a.concat(b).forEach(m => {m.x -= minX; m.y -= minY;});
+  bands.forEach(s => [s.start,s.end].forEach(p => {p[0] -= minX; p[1] -= minY;}));
+  return {outputs, bands, note:empty ? 'Segments are not set. Move a monitor to set them.' :
+    custom ? 'Custom values are set in Advanced. Moving a monitor here replaces them.' : ''};
+}
+
+// Derives every field the layout owns from where the boxes sit: counts, chain
+// and border directions, and the segments in seam order. Returns {fields}, or
+// {refused} with the one-line reason the board cannot run this layout.
+function fieldsFromLayout(layout) {
+  const [a, b] = layout.outputs.map(o => o.monitors);
+  // A straight line of equal boxes fills its bounding box, so the boxes are the box.
+  const bounds = ms => [0,1].map(axis => [Math.min(...ms.map(m => at(m, axis))), Math.max(...ms.map(m => at(m, axis)))+1]);
+  const [boxA, boxB] = [bounds(a), bounds(b)];
+  const overlap = [0,1].map(axis => Math.min(boxA[axis][1], boxB[axis][1]) - Math.max(boxA[axis][0], boxB[axis][0]));
+  if (overlap.some(v => v < 0)) return {refused:'Not moved: that leaves a gap between the computers. Put them edge to edge.'};
+  if (overlap.every(v => v > 0)) return {refused:'Not moved: the computers would overlap. Put them edge to edge.'};
+  if (overlap.every(v => v === 0)) return {refused:'Not moved: the computers would touch only at a corner. Put an edge against an edge.'};
+  const normal = overlap[0] === 0 ? 0 : 1, tangent = 1-normal;
+  const forward = boxA[normal][1] === boxB[normal][0];
+  const seam = boxA[normal][forward ? 1 : 0];
+  const borders = [normal ? (forward ? 5 : 4) : (forward ? 2 : 1)];
+  borders.push(opposite[borders[0]]);
+  const fields = {};
+  for (const [i, o] of layout.outputs.entries()) {
+    const ms = o.monitors, base = i ? 40 : 10;
+    let chain = o.chain;
+    if (ms.length > 1) {
+      const dx = ms[1].x-ms[0].x, dy = ms[1].y-ms[0].y;
+      chain = dx < 0 ? 1 : dx > 0 ? 2 : dy < 0 ? 4 : 5;
+      // The board lets only Main cross when the line points at the other computer.
+      if (chain === borders[i]) return {refused:'Not moved: put the main monitor next to the other computer.'};
+    }
+    fields[base+1] = ms.length; fields[98+i] = chain; fields[base+7] = borders[i];
+  }
+  const facing = (ms, positive) => ms.filter(m => at(m, normal) + (positive ? 1 : 0) === seam);
+  const pairs = [];
+  for (const p of facing(a, forward)) for (const q of facing(b, !forward)) {
+    const start = Math.max(at(p, tangent), at(q, tangent)), end = Math.min(at(p, tangent), at(q, tangent))+1;
+    if (end > start) pairs.push({start, end, sides:[p, q]});
+  }
+  pairs.sort((u, v) => u.start-v.start);
+  if (pairs.length > 4) return {refused:`Not moved: that layout needs ${pairs.length} segments; the board holds 4.`};
+  [140, 152].forEach((base, i) => {
+    for (let n = 0; n < 4; n++) {
+      const pair = pairs[n], m = pair && pair.sides[i];
+      fields[base+3*n] = pair ? m.number : 0;
+      fields[base+3*n+1] = pair ? Math.round((pair.start-at(m, tangent))*65535) : 0;
+      fields[base+3*n+2] = pair ? Math.round((pair.end-at(m, tangent))*65535) : 0;
+    }
+  });
+  return {fields};
+}
+
+// Applies one gesture to one output and returns {layout, fields}, or
+// {layout, refused} with the layout unchanged. Gestures:
+//   {dx, dy}           move the computer as a block by dx, dy boxes;
+//   {monitor, dx, dy}  drop one box: Main onto its line's far end flips the line
+//                      (the boxes stay put, renumbered from Main); another
+//                      box turns the line to point from Main toward its cell;
+//                      the only box of a one-monitor computer moves the block;
+//   {add: 1 | -1}      append a box at the end of the line, or remove the last.
+function moveMonitor(layout, gesture) {
+  const o = layout.outputs.find(o => o.letter === gesture.output), ms = o.monitors;
+  const main = ms[0], last = ms[ms.length-1];
+  const dir = ms.length > 1 ? [Math.sign(ms[1].x-main.x), Math.sign(ms[1].y-main.y)] : vectors[o.chain] || [1,0];
+  const line = (from, [dx, dy], count) => Array.from({length:count}, (_, n) => ({number:n+1, x:from.x+n*dx, y:from.y+n*dy}));
+  let monitors;
+  if (gesture.add > 0) {
+    if (ms.length >= 7) return {layout, refused:'Not added: a computer holds at most 7 monitors.'};
+    monitors = line(main, dir, ms.length+1);
+  } else if (gesture.add < 0) {
+    if (ms.length < 2) return {layout, refused:'Not removed: a computer keeps its main monitor.'};
+    monitors = ms.slice(0, -1);
+  } else if (!gesture.monitor || ms.length < 2) {
+    monitors = ms.map(m => ({...m, x:m.x+gesture.dx, y:m.y+gesture.dy}));
+  } else if (gesture.monitor === 1) {
+    if (last.x !== main.x+gesture.dx || last.y !== main.y+gesture.dy)
+      return {layout, refused:`Not moved: drop Main on monitor ${last.number} to flip it, or drag the label to move the whole computer.`};
+    monitors = line(last, dir.map(v => -v), ms.length);
+  } else {
+    const m = ms[gesture.monitor-1];
+    const d = [m.x+gesture.dx-main.x, m.y+gesture.dy-main.y];
+    // A cell off the line turns the line across its axis; a cell on it turns it along.
+    const along = dir[0] ? 0 : 1, axis = d[1-along] ? 1-along : along;
+    if (!d[axis]) return {layout, refused:'Not moved: drop a monitor beside, above or below the main monitor.'};
+    monitors = line(main, axis ? [0, Math.sign(d[1])] : [Math.sign(d[0]), 0], ms.length);
+  }
+  const outputs = layout.outputs.map(p => p === o ? {...o, monitors} : p);
+  const result = fieldsFromLayout({outputs});
+  if (result.refused) return {layout, refused:result.refused};
+  const moved = layoutFromFields(result.fields);
+  moved.outputs.forEach((o, i) => {o.os = layout.outputs[i].os;});
+  return {layout:moved, fields:result.fields};
+}
+
+function renderLayout(layout) {
+  if (!layout) return '<p>Connect to see your monitor layout.</p>';
+  const monitors = layout.outputs.flatMap(o => o.monitors);
+  const width = Math.max(...monitors.map(m => m.x))+1;
+  const height = Math.max(...monitors.map(m => m.y))+1;
+  const spareRow = height < 2 ? 1 : 0;
+  const canvasHeight = (height+2*spareRow)*100+20;
+  // Each cell is 100 units: the label bar sits in the top 18, then a gap, then
+  // the monitor box. The bar spans the block and is the handle that moves it;
+  // each box is a focusable handle of its own.
+  const groups = layout.outputs.map(o => {
+    const left = Math.min(...o.monitors.map(m => m.x))*100+12, top = Math.min(...o.monitors.map(m => m.y))*100+12;
+    const right = Math.max(...o.monitors.map(m => m.x))*100+88;
+    return `<g class="layout-${o.letter}" data-output="${o.letter}" aria-label="Output ${o.letter}: ${o.os}"><g class="layout-handle"><rect x="${left}" y="${top}" width="${right-left}" height="18" rx="5"/><text x="${(left+right)/2}" y="${top+13}">${right-left > 76 ? 'Output ' : ''}${o.letter} · ${o.os}</text></g>${o.monitors.map(m =>
+      `<g class="layout-box" data-output="${o.letter}" data-monitor="${m.number}" tabindex="0" aria-label="Output ${o.letter} ${m.number === 1 ? 'main monitor' : 'monitor '+m.number}"><rect class="layout-monitor${m.number === 1 ? ' layout-main' : ''}" x="${m.x*100+12}" y="${m.y*100+36}" width="76" height="52" rx="5"/><text x="${m.x*100+50}" y="${m.y*100+68}">${m.number === 1 ? 'Main' : m.number}</text></g>`).join('')}</g>`;
+  }).join('');
+  const bands = layout.bands.map(s => `<g data-segment="${s.number}"><line class="layout-band" x1="${s.start[0]*100}" y1="${s.start[1]*100}" x2="${s.end[0]*100}" y2="${s.end[1]*100}"/><text class="layout-band-number" x="${(s.start[0]+s.end[0])*50}" y="${(s.start[1]+s.end[1])*50+5}">${s.number}</text></g>`).join('');
+  const counts = layout.outputs.map(o => `<span>Output ${o.letter}: <button type="button" aria-label="Remove a monitor from Output ${o.letter}" onclick="applyGesture({output:'${o.letter}',add:-1})">−</button> ${o.monitors.length} <button type="button" aria-label="Add a monitor to Output ${o.letter}" onclick="applyGesture({output:'${o.letter}',add:1})">+</button></span>`).join('');
+  return `<svg role="group" aria-label="Monitor layout" viewBox="-10 ${-10-spareRow*100} ${width*100+20} ${canvasHeight}" style="max-height:${canvasHeight}px">${groups}${bands}</svg><p class="layout-counts">${counts}</p>${layout.note ? `<p>${layout.note} <a href="#advanced" onclick="document.getElementById('advanced').open = true">Open Advanced</a></p>` : ''}`;
+}
+
+function readFields() {
+  return Object.fromEntries([...document.querySelectorAll('.api[data-key]')].map(e => [e.dataset.key, getValue(e)]));
+}
+
+function showLayoutStatus(message = '', ok = false) {
+  const status = document.getElementById('layout-status');
+  if (status.textContent !== message) status.textContent = message;
+  status.classList.toggle('layout-ok', ok);
+}
+
+function redrawLayout() {
+  document.getElementById('layout').innerHTML = renderLayout(device && device.opened ? layoutFromFields(readFields()) : null);
+  showLayoutStatus();
+}
+
+// Every gesture ends here. A valid one writes the derived values into the
+// Advanced fields, the same as picking them by hand: Save sends them to the
+// board, Read throws them away. A refused one shows its reason and touches nothing.
+function applyGesture(gesture) {
+  const result = moveMonitor(layoutFromFields(readFields()), gesture);
+  if (result.refused) {showLayoutStatus(result.refused); return;}
+  for (const [key, value] of Object.entries(result.fields))
+    document.querySelector(`.api[data-key="${key}"]`).value = value;
+  redrawLayout();
+}
+
+// Pointer glue: a label bar drags the computer in half-box steps, a box drags
+// in whole boxes, so each lands where it is shown. The only box of a
+// one-monitor computer is its label.
+document.getElementById('layout').addEventListener('pointerdown', event => {
+  const target = event.target.closest('.layout-handle, .layout-box');
+  if (!target || event.button !== 0 || !event.isPrimary) return;
+  event.preventDefault();
+  showLayoutStatus();
+  const computer = target.parentNode, scale = target.ownerSVGElement.getScreenCTM().a;
+  const box = target.dataset.monitor && computer.querySelectorAll('.layout-box').length > 1 ? target : null;
+  const moving = box || computer, step = box ? 1 : 0.5;
+  const delta = e => [e.clientX-event.clientX, e.clientY-event.clientY].map(v => Math.round(v/scale/100/step)*step);
+  const gesture = e => {const [dx, dy] = delta(e); return {output:computer.dataset.output, monitor:Number(target.dataset.monitor), dx, dy};};
+  const samePointer = e => e.pointerId === event.pointerId;
+  const stop = () => {
+    window.removeEventListener('pointermove', follow); window.removeEventListener('pointerup', drop);
+    window.removeEventListener('pointercancel', cancel); moving.removeAttribute('transform');
+  };
+  const follow = e => {
+    if (!samePointer(e)) return;
+    const current = gesture(e);
+    moving.setAttribute('transform', `translate(${[current.dx,current.dy].map(v => v*100).join(' ')})`);
+    if (!current.dx && !current.dy) return showLayoutStatus();
+    const result = moveMonitor(layoutFromFields(readFields()), current);
+    showLayoutStatus(result.refused || 'Release to apply.', !result.refused);
+  };
+  const drop = e => {
+    if (!samePointer(e)) return;
+    stop();
+    const current = gesture(e);
+    // A click on a box only focuses it.
+    if (target.dataset.monitor && !current.dx && !current.dy) return target.focus();
+    applyGesture(current);
+  };
+  const cancel = e => {if (samePointer(e)) {stop(); showLayoutStatus();}};
+  window.addEventListener('pointermove', follow); window.addEventListener('pointerup', drop);
+  window.addEventListener('pointercancel', cancel);
+});
+
+// Arrow keys on a focused box are a one-step drop; the box keeps focus.
+document.getElementById('layout').addEventListener('keydown', event => {
+  const box = event.target.closest('.layout-box');
+  const step = {ArrowLeft:[-1,0], ArrowRight:[1,0], ArrowUp:[0,-1], ArrowDown:[0,1]}[event.key];
+  if (!box || !step) return;
+  event.preventDefault();
+  const {output, monitor} = box.dataset;
+  applyGesture({output, monitor:Number(monitor), dx:step[0], dy:step[1]});
+  document.querySelector(`.layout-box[data-output="${output}"][data-monitor="${monitor}"]`).focus();
+});
+// Page glue for the settings window (#225): which section is shown, which
+// computer's rows are under the picture, the connection words, the unsaved
+// count and the refusal strip. Presentation only: no field is duplicated and
+// nothing here talks to the board.
+
+function showSection(id) {
+  document.querySelectorAll('section[data-section]').forEach(s => {s.hidden = s.dataset.section !== id;});
+  document.querySelectorAll('#sidebar button').forEach(b => {
+    if (b.dataset.section === id) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+  });
+}
+
+document.getElementById('sidebar').addEventListener('click', event => {
+  const button = event.target.closest('button[data-section]');
+  if (button) showSection(button.dataset.section);
+});
+
+// Click a computer in the picture and its rows appear under it, the way the
+// OS shows the settings of the monitor you click.
+function selectComputer(letter) {
+  document.getElementById('layout').dataset.selected = letter;
+  document.querySelectorAll('.computer[data-computer]').forEach(c => {c.hidden = c.dataset.computer !== letter;});
+  refreshTitles();
+}
+
+// "Output A · MacOS": the group title carries the OS the picture's label shows.
+function refreshTitles() {
+  document.querySelectorAll('[data-os-of]').forEach(span => {
+    const os = [...document.querySelectorAll(`.computer[data-computer="${span.dataset.osOf}"] .row`)]
+      .find(row => row.querySelector('label')?.textContent === 'Operating System')?.querySelector('select');
+    const name = os && os.selectedIndex > 0 ? os.options[os.selectedIndex].text : '';
+    span.textContent = name ? ' · ' + name : '';
+  });
+}
+
+for (const type of ['pointerdown', 'focusin', 'keydown'])
+  document.getElementById('layout').addEventListener(type, event => {
+    const computer = event.target.closest('[data-output]');
+    if (computer) selectComputer(computer.dataset.output);
+  });
+
+// Every gesture ends in a redraw of the picture, and a drop writes its fields
+// without an event, so the redraw is where the unsaved count follows a drop.
+// The same pass keeps a wide desk (up to seven monitors a side) readable: at
+// least 0.9px per picture unit, and the picture scrolls inside the well
+// instead of shrinking to a strip.
+new MutationObserver(() => {
+  const svg = document.querySelector('#layout svg');
+  if (svg) svg.style.minWidth = Math.round(svg.viewBox.baseVal.width * 0.9) + 'px';
+  refresh();
+}).observe(document.getElementById('layout'), {childList: true});
+
+// Connect flips every board-facing control on; the words in the toolbar say
+// so. The markup starts disabled, so nothing runs at load.
+const connected = () => document.getElementById('connection').dataset.on === '1';
+
+function setConnected(on) {
+  const words = document.getElementById('connection');
+  words.textContent = on ? 'Connected — config mode' : 'Not connected';
+  words.dataset.on = on ? '1' : '';
+  document.getElementById('fields').disabled = !on;
+  document.querySelectorAll('.online').forEach(b => {b.disabled = !on;});
+  // Off: the picture goes back to its connect text, so nothing can be dragged.
+  if (!on) redrawLayout();
+}
+
+// Unsaved: derived, never stored. A field is unsaved when its value differs
+// from what the last Read fetched. Save shows the count; a section with one
+// or more carries a dot.
+function unsavedFields() {
+  return [...document.querySelectorAll('.api, .hotkey-text, .keymap-text')].filter(f =>
+    !f.readOnly && f.type !== 'hidden' && f.hasAttribute('fetched-value') && f.getAttribute('fetched-value') != getValue(f));
+}
+
+function refreshUnsaved() {
+  const fields = unsavedFields();
+  const badge = document.getElementById('unsaved');
+  badge.textContent = fields.length;
+  badge.hidden = !fields.length;
+  const sections = new Set(fields.map(f => f.closest('section[data-section]').dataset.section));
+  document.querySelectorAll('#sidebar button').forEach(b => b.toggleAttribute('data-unsaved', sections.has(b.dataset.section)));
+}
+
+// Status LED: After means nothing while Turn off is Never (#283).
+function refreshStatusLed() {
+  const mode = document.querySelector('[data-key="101"]');
+  const after = document.querySelector('[data-key="102"]');
+  if (mode && after) after.disabled = !Number(mode.value);
+}
+
+// What every edit, report and toolbar action refreshes.
+function refresh() {
+  refreshUnsaved();
+  refreshTitles();
+  refreshStatusLed();
+}
+
+document.getElementById('main').addEventListener('input', event => {
+  if (event.target.getAttribute('aria-invalid')) {
+    event.target.removeAttribute('aria-invalid');
+    event.target.closest('.row').querySelector('small').textContent = '';
+  }
+  refresh();
+});
+document.getElementById('main').addEventListener('change', refresh);
+
+// Exit reboots the board, which drops the device: the toolbar says so. A
+// page that already reported why (an action threw first) keeps its reason.
+navigator.hid?.addEventListener('disconnect', event => {
+  if (event.device === device && connected()) setConnected(false);
+});
+
+// Toolbar actions run one at a time: the toolbar is disabled while one runs,
+// so a second click on Save cannot start a second Save loop. A refused Save
+// bands the top of the window with the fields that need a fix. An action that
+// throws means the board is gone or was never chosen: the page says so and
+// keeps the user's values for a later Read or Save.
+document.getElementById('menu-buttons').addEventListener('click', async event => {
+  const handler = event.target.closest('button')?.dataset.handler;
+  if (!handler) return;
+  const buttons = [...document.querySelectorAll('#menu-buttons button')];
+  buttons.forEach(b => {b.disabled = true;});
+  try {
+    const result = await window[handler]();
+    // Back to the rule, not to a snapshot: Connect may just have turned the page on.
+    buttons.forEach(b => {b.disabled = b.classList.contains('online') && !connected();});
+    if (handler === 'saveHandler') showRefusal(result === false);
+    // Read replaces the values the last Save refused, so its errors go too.
+    if (handler === 'readHandler') clearErrors();
+  } catch (error) {
+    console.error(error);
+    setConnected(false);
+    document.querySelector('[data-handler="connectHandler"]').disabled = false;
+    document.getElementById('connection').textContent = 'Not connected — ' + (error.message || error);
+  }
+  refresh();
+});
+
+function clearErrors() {
+  document.querySelectorAll('.hotkey-error, .keymap-error').forEach(e => {e.textContent = '';});
+  showRefusal(false);
+}
+
+function revealField(field) {
+  showSection(field.closest('section[data-section]').dataset.section);
+  const computer = field.closest('.computer[data-computer]');
+  if (computer) selectComputer(computer.dataset.computer);
+  const advanced = field.closest('details');
+  if (advanced) advanced.open = true;
+  field.scrollIntoView({block: 'center'});
+  field.focus();
+}
+
+function showRefusal(refused) {
+  const strip = document.getElementById('refusal');
+  const rows = refused ? [...document.querySelectorAll('.row')].filter(r => r.querySelector('small')?.textContent) : [];
+  const control = row => row.querySelector('input, textarea');
+  document.querySelectorAll('[aria-invalid]').forEach(f => f.removeAttribute('aria-invalid'));
+  rows.forEach(r => control(r).setAttribute('aria-invalid', 'true'));
+  strip.hidden = !rows.length;
+  if (!rows.length) return;
+  const name = row => {
+    const section = row.closest('section[data-section]').querySelector('h2').textContent;
+    const computer = row.closest('.computer[data-computer]');
+    return `${section} › ${computer ? 'Output ' + computer.dataset.computer + ' ' : ''}${row.querySelector('label').textContent}`;
+  };
+  const esc = text => text.replace(/[&<>]/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;'}[c]));
+  strip.lastElementChild.innerHTML = `<strong>Save refused.</strong> ${rows.length} field${rows.length > 1 ? 's need' : ' needs'} a fix; nothing was sent.<ul>` +
+    rows.map(row => `<li><a href="#">${esc(name(row))}</a>: ${esc(row.querySelector('small').textContent)}</li>`).join('') + '</ul>';
+  strip.querySelectorAll('a').forEach((a, i) => a.addEventListener('click', e => {e.preventDefault(); revealField(control(rows[i]));}));
+  revealField(control(rows[0]));
+}
+
+// Service: a button that wipes or reboots takes two clicks. The first arms it
+// and says so; the second acts; a click anywhere else disarms it.
+window.addEventListener('click', event => {
+  const armed = document.querySelector('#service-buttons button[data-armed]');
+  if (armed && !armed.contains(event.target)) {armed.textContent = armed.dataset.armed; delete armed.dataset.armed;}
+});
+document.getElementById('service-buttons').addEventListener('click', event => {
+  const button = event.target.closest('button[data-handler]');
+  if (!button) return;
+  if (button.dataset.arm && !button.dataset.armed) {
+    button.dataset.armed = button.textContent;
+    button.textContent = button.dataset.arm;
+    return;
+  }
+  if (button.dataset.armed) {button.textContent = button.dataset.armed; delete button.dataset.armed;}
+  window[button.dataset.handler]();
+});
+  </script>
+</body>
+
+</html>

@@ -1,0 +1,69 @@
+# ADR-0011: The paste side's user starts a file transfer, not a paste
+
+- **Status:** Accepted
+- **Date:** 2026-09-02
+- **Resolves:** [#56](https://github.com/myn/deskhopplus/issues/56)
+- **Amends:** [ADR-0010](0010-prefetch-large-images-before-platform-publication.md)
+
+A file transfer begins when the paste side's user accepts an offer in the menu bar or tray, not
+when an application asks the platform for the file's bytes. The copy side stays lazy: file contents
+are read only on `CLIP_REQUEST`, which now arrives only after that acceptance.
+
+#56 asks for a transfer that "begins on paste, not on copy", and both platform APIs that would make
+a paste itself the trigger fail the same way ADR-0010 already recorded for images. `CF_HDROP`
+delayed rendering answers `WM_RENDERFORMAT` synchronously, so the pasting application blocks for
+the whole transfer; the virtual-file alternative, `CFSTR_FILEDESCRIPTOR` with
+`CFSTR_FILECONTENTS`, needs a full OLE `IDataObject` and is enumerated speculatively by Explorer
+previews, which starts transfers nobody asked for. On macOS an `NSPasteboardItemDataProvider`
+blocks the pasting application outright, and `NSFilePromiseProvider` is honoured inconsistently
+outside Finder. At the measured ~49 KB/s of #39 a 10 MB paste is roughly three and a half minutes,
+so any of these is a frozen application rather than a slow one.
+
+Acceptance keeps what the user story wanted and drops what it assumed. Copying costs nothing: the
+offer carries the file list alone, and a folder copied and never pasted is never opened. The
+transfer then runs with progress and a cancel, and the files are published as ordinary references
+once complete, so the paste itself is instant and no application is ever blocked.
+
+**Sets at or below 1 MB are accepted without asking**, and that is a second deviation from the
+same criterion rather than a detail of the first: their bytes cross on the copy, with no paste and
+no decision. It buys back what acceptance costs for the common case — under a second at the
+measured rate — and the alternative is worse than the deviation, because a dialog for a
+quarter-second transfer is how the dialog that matters gets dismissed unread. Above the threshold
+nothing crosses the link without an explicit decision on the receiving computer.
+
+An offer put to the user expires after two minutes and is declined for them. Not because the
+question is urgent: an offer accepted-as-lazy and never requested leaves the copy side re-offering
+every two seconds for the life of the session (#78), and it pins the receive buffer the size cap
+sizes, so the cap cannot change while the question stands.
+
+The cost is that the gesture is a menu-bar or tray answer rather than Cmd-V or Ctrl-V, so a user
+who ignores the prompt has files that never arrive. Both helpers therefore show the question in
+their permanent presence and not only in a notification, which is also why #56 carries the first
+slice of [#54](https://github.com/myn/deskhopplus/issues/54): before this the macOS helper had no
+user interface at all.
+
+## Amendment, 2026-09-14 — a lazy file is sent at the offered length
+
+The offer's total is the length that will be sent, measured at the copy, and the copy side sends
+exactly that when the request arrives. A file that **grew** since the copy is sent as its first
+offered-length bytes, as they are at request time: for a log or any other appending writer that is
+the file as it was when copied, which is also what `cp` gives. A file that **shrank** cannot supply
+the offered length and the transfer fails, as it did before. The helper logs which of the two
+happened and, on a failed read, the file's name, the step that failed and the platform error
+([#181](https://github.com/myn/deskhopplus/issues/181)).
+
+Before this both providers refused any file whose size had changed, citing #56. That was a
+misreading: #56's criterion is that an *aborted* transfer never presents the partial file it leaves
+on the paste side as complete — a paste-side cleanup rule, not a copy-side read rule. Refusing
+every changed file meant that copying a log, a database or a download in progress produced no file
+at all ([#182](https://github.com/myn/deskhopplus/issues/182)).
+
+On Windows the read also opens the file with share-write, not share-read alone. A log that is still
+growing is held open by its writer, and Win32 refuses a read-open that does not share write while a
+writer holds the file. The helper's own `helper.log` is such a file: its copy in the #182 report
+failed at the open, before the size check was reached.
+
+The accepted cost is a file **rewritten** at a larger size — a document saved between the copy and
+the acceptance — which arrives cut to the old length. Nothing on the copy side can tell an appended
+file from a rewritten one without reading it at copy time, which the lazy rule above forbids, and
+re-offering at the new size would loop for exactly the growing file this amendment exists for.

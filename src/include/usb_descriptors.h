@@ -1,0 +1,241 @@
+/*
+ * This file is part of DeskHop (https://github.com/hrvach/deskhop).
+ * Copyright (c) 2025 Hrvoje Cavrak
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * See the file LICENSE for the full license text.
+ * Modified by Derek Reynolds, 2026, for deskhopplus.
+ */
+
+#ifndef USB_DESCRIPTORS_H_
+#define USB_DESCRIPTORS_H_
+
+#include <stdbool.h>
+#include "dh_channel_identity.h"
+
+// Interface 0
+#define REPORT_ID_KEYBOARD 1
+#define REPORT_ID_MOUSE    2
+#define REPORT_ID_CONSUMER 3
+#define REPORT_ID_SYSTEM   4
+
+// Interface 1
+#define REPORT_ID_RELMOUSE  5
+#define REPORT_ID_DIGITIZER 7
+
+// Interface 2
+#define REPORT_ID_VENDOR 6
+
+/* Channel report size, in bytes. One report is one full-speed interrupt
+   packet, so this is also the endpoint's wMaxPacketSize and must not exceed
+   CFG_TUD_HID_EP_BUFSIZE (a static assert in usb_descriptors.c holds the two
+   together). */
+#define CHANNEL_REPORT_SIZE DH_CHANNEL_REPORT_SIZE
+
+/* wMaxPacketSize of the keyboard, mouse and config interfaces. Pinned to the
+   value they have always enumerated with, so that sizing the driver buffer
+   for the channel leaves the interfaces that already work - including at BIOS
+   and disk-encryption prompts - byte-identical on the wire. */
+#define LEGACY_EP_PACKET_SIZE 32
+
+void discard_queued_host_reports(void);
+void set_local_boot_mouse_mode(bool boot);
+
+
+#define DEVICE_DESCRIPTOR(vid, pid) \
+{.bLength         = sizeof(tusb_desc_device_t),\
+  .bDescriptorType = TUSB_DESC_DEVICE,\
+  .bcdUSB          = 0x0200,\
+  .bDeviceClass    = 0x00,\
+  .bDeviceSubClass = 0x00,\
+  .bDeviceProtocol = 0x00,\
+  .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,\
+  .idVendor  = vid,\
+  .idProduct = pid,\
+  .bcdDevice = 0x0100,\
+  .iManufacturer = 0x01,\
+  .iProduct      = 0x02,\
+  .iSerialNumber = 0x03,\
+  .bNumConfigurations = 0x01}\
+
+/* Common mouse descriptor. Use HID_RELATIVE or HID_ABSOLUTE for ABS_OR_REL. */
+#define TUD_HID_REPORT_DESC_MOUSE_COMMON(ABS_OR_REL, MOUSE_MIN, ...)\
+  HID_USAGE_PAGE ( HID_USAGE_PAGE_DESKTOP      )                   ,\
+  HID_USAGE      ( HID_USAGE_DESKTOP_MOUSE     )                   ,\
+  HID_COLLECTION ( HID_COLLECTION_APPLICATION  )                   ,\
+    /* Report ID if any */\
+    __VA_ARGS__ \
+    HID_USAGE      ( HID_USAGE_DESKTOP_POINTER )                   ,\
+    HID_COLLECTION ( HID_COLLECTION_PHYSICAL   )                   ,\
+      HID_USAGE_PAGE  ( HID_USAGE_PAGE_BUTTON  )                   ,\
+        HID_USAGE_MIN   ( 1                                      ) ,\
+        HID_USAGE_MAX   ( 8                                      ) ,\
+        HID_LOGICAL_MIN ( 0                                      ) ,\
+        HID_LOGICAL_MAX ( 1                                      ) ,\
+        \
+        /* Left, Right, Mid, Back, Forward buttons + 3 extra */     \
+        HID_REPORT_COUNT( 8                                      ) ,\
+        HID_REPORT_SIZE ( 1                                      ) ,\
+        HID_INPUT       ( HID_DATA | HID_VARIABLE | HID_ABSOLUTE ) ,\
+        \
+      HID_USAGE_PAGE  ( HID_USAGE_PAGE_DESKTOP )                   ,\
+        \
+        /* X, Y position [MOUSE_MIN, 32767] */ \
+        HID_USAGE       ( HID_USAGE_DESKTOP_X                    ) ,\
+        HID_USAGE       ( HID_USAGE_DESKTOP_Y                    ) ,\
+        MOUSE_MIN                                                  ,\
+        HID_LOGICAL_MAX_N( 0x7FFF, 2                             ) ,\
+        HID_REPORT_SIZE  ( 16                                    ) ,\
+        HID_REPORT_COUNT ( 2                                     ) ,\
+        HID_INPUT       ( HID_DATA | HID_VARIABLE | ABS_OR_REL   ) ,\
+        \
+        /* Vertical wheel scroll [-127, 127] */ \
+        HID_USAGE       ( HID_USAGE_DESKTOP_WHEEL                ) ,\
+        HID_LOGICAL_MIN ( 0x81                                   ) ,\
+        HID_LOGICAL_MAX ( 0x7f                                   ) ,\
+        HID_REPORT_COUNT( 1                                      ) ,\
+        HID_REPORT_SIZE ( 8                                      ) ,\
+        HID_INPUT       ( HID_DATA | HID_VARIABLE | HID_RELATIVE ) ,\
+        \
+        /* Horizontal wheel (AC Pan) */ \
+        HID_USAGE_PAGE  ( HID_USAGE_PAGE_CONSUMER                ) ,\
+        HID_LOGICAL_MIN ( 0x81                                   ) ,\
+        HID_LOGICAL_MAX ( 0x7f                                   ) ,\
+        HID_REPORT_COUNT( 1                                      ) ,\
+        HID_REPORT_SIZE ( 8                                      ) ,\
+        HID_USAGE_N     ( HID_USAGE_CONSUMER_AC_PAN, 2           ) ,\
+        HID_INPUT       ( HID_DATA | HID_VARIABLE | HID_RELATIVE ) ,\
+        \
+        /* Mouse mode (0 = absolute, 1 = relative, 3 = boot-relative) */ \
+        HID_REPORT_COUNT( 1                                      ), \
+        HID_REPORT_SIZE ( 8                                      ), \
+        HID_INPUT       ( HID_CONSTANT                           ), \
+    HID_COLLECTION_END                                            , \
+  HID_COLLECTION_END \
+
+/* Absolute mouse, range=[0..32767] */
+#define TUD_HID_REPORT_DESC_ABS_MOUSE(...) TUD_HID_REPORT_DESC_MOUSE_COMMON(HID_ABSOLUTE, HID_LOGICAL_MIN(0), __VA_ARGS__)
+
+/* Relative mouse, range=[-32767..32767] */
+#define TUD_HID_REPORT_DESC_MOUSEHELP(...) TUD_HID_REPORT_DESC_MOUSE_COMMON(HID_RELATIVE, HID_LOGICAL_MIN_N(-32767, 2), __VA_ARGS__)
+
+// Consumer Control Report Descriptor Template
+#define TUD_HID_REPORT_DESC_CONSUMER_CTRL(...) \
+  HID_USAGE_PAGE ( HID_USAGE_PAGE_CONSUMER    )              ,\
+  HID_USAGE      ( HID_USAGE_CONSUMER_CONTROL )              ,\
+  HID_COLLECTION ( HID_COLLECTION_APPLICATION )              ,\
+    /* Report ID if any */\
+    __VA_ARGS__ \
+    HID_LOGICAL_MIN  ( 0x00                                ) ,\
+    HID_LOGICAL_MAX_N( 0x0FFF, 2                           ) ,\
+    HID_USAGE_MIN    ( 0x00                                ) ,\
+    HID_USAGE_MAX_N  ( 0x0FFF, 2                           ) ,\
+    HID_REPORT_SIZE  ( 16                                  ) ,\
+    HID_REPORT_COUNT ( 2                                   ) ,\
+    HID_INPUT        ( HID_DATA | HID_ARRAY | HID_ABSOLUTE ) ,\
+  HID_COLLECTION_END \
+
+// System Control Report Descriptor Template
+#define TUD_HID_REPORT_DESC_SYSTEM_CTRL(...) \
+  HID_USAGE_PAGE ( HID_USAGE_PAGE_DESKTOP    )               ,\
+  HID_USAGE      ( HID_USAGE_DESKTOP_SYSTEM_CONTROL )        ,\
+  HID_COLLECTION ( HID_COLLECTION_APPLICATION )              ,\
+    /* Report ID if any */\
+    __VA_ARGS__ \
+    HID_LOGICAL_MIN ( 0x00                                )  ,\
+    HID_LOGICAL_MAX ( 0xff                                )  ,\
+    HID_REPORT_COUNT( 1                                   )  ,\
+    HID_REPORT_SIZE ( 8                                   )  ,\
+    HID_INPUT        ( HID_DATA | HID_ARRAY | HID_ABSOLUTE ) ,\
+  HID_COLLECTION_END \
+
+// Vendor Config Descriptor Template
+#define TUD_HID_REPORT_DESC_VENDOR_CTRL(...) \
+  HID_USAGE_PAGE_N ( HID_USAGE_PAGE_VENDOR, 2 )             ,\
+  HID_USAGE      ( DH_CHANNEL_CONFIG_API_USAGE )            ,\
+  HID_COLLECTION ( HID_COLLECTION_APPLICATION )             ,\
+    /* Report ID if any */\
+    __VA_ARGS__ \
+    HID_LOGICAL_MIN ( 0x80                                )  ,\
+    HID_LOGICAL_MAX ( 0x7f                                )  ,\
+    HID_REPORT_COUNT( 12                                  )  ,\
+    HID_REPORT_SIZE ( 8                                   )  ,\
+    HID_USAGE       ( 0x10                                )  ,\
+    HID_INPUT        ( HID_DATA | HID_ARRAY | HID_ABSOLUTE ) ,\
+    HID_USAGE       ( 0x10                                )  ,\
+    HID_OUTPUT       ( HID_DATA | HID_ARRAY | HID_ABSOLUTE ) ,\
+  HID_COLLECTION_END \
+
+// Channel Descriptor Template - vendor-page collections only. Sharing an
+// interface with keyboard or mouse would make macOS require Input Monitoring
+// for the whole node (ADR-0001; docs/research/hid-transport-macos-tcc.md §4).
+// The usage differs from the config interface's 0x10 so a helper can match on
+// usage page and usage rather than on a device path.
+#define TUD_HID_REPORT_DESC_CHANNEL(usage, ...) \
+  HID_USAGE_PAGE_N ( DH_CHANNEL_USAGE_PAGE, 2 )             ,\
+  HID_USAGE      ( usage )                                   ,\
+  HID_COLLECTION ( HID_COLLECTION_APPLICATION )             ,\
+    /* Report ID if any */\
+    __VA_ARGS__ \
+    HID_LOGICAL_MIN  ( 0x00                               )  ,\
+    HID_LOGICAL_MAX_N( 0x00FF, 2                          )  ,\
+    HID_REPORT_SIZE ( 8                                   )  ,\
+    HID_REPORT_COUNT( CHANNEL_REPORT_SIZE                 )  ,\
+    HID_USAGE       ( 0x21                                )  ,\
+    HID_INPUT        ( HID_DATA | HID_VARIABLE | HID_ABSOLUTE ) ,\
+    HID_USAGE       ( 0x22                                )  ,\
+    HID_OUTPUT       ( HID_DATA | HID_VARIABLE | HID_ABSOLUTE ) ,\
+  HID_COLLECTION_END \
+
+#define HID_USAGE_DIGITIZER 0x01
+
+#define TUD_HID_REPORT_DESC_DIGITIZER_PEN(...) \
+HID_USAGE_PAGE ( HID_USAGE_PAGE_DIGITIZER )                 ,\
+HID_USAGE ( HID_USAGE_DIGITIZER )                           ,\
+HID_COLLECTION ( HID_COLLECTION_APPLICATION )               ,\
+  /* Report ID if any */\
+  __VA_ARGS__ \
+  HID_USAGE ( HID_USAGE_DIGITIZER )                         ,\
+  HID_COLLECTION ( HID_COLLECTION_PHYSICAL )                ,\
+    HID_USAGE_PAGE ( HID_USAGE_PAGE_DIGITIZER )             ,\
+    /* Tip Pressure */\
+    HID_USAGE      ( 0x30 )                                 ,\
+    HID_LOGICAL_MIN ( 0x00                                )  ,\
+    HID_LOGICAL_MAX ( 0xff                                )  ,\
+    HID_REPORT_COUNT( 1                                      )  ,\
+    HID_REPORT_SIZE ( 8                                      )  ,\
+    HID_INPUT ( HID_DATA | HID_VARIABLE | HID_ABSOLUTE )    ,\
+    \
+    HID_REPORT_COUNT( 5                                      )  ,\
+    HID_REPORT_SIZE ( 1                                      )  ,\
+    /* In range */\
+    HID_USAGE ( 0x32 )                       ,\
+    /* Tip switch */\
+    HID_USAGE ( 0x42 )                       ,\
+    /* Eraser */\
+    HID_USAGE ( 0x45 )                       ,\
+    /* Barrel switch */\
+    HID_USAGE ( 0x44 )                       ,\
+    /* Invert */\
+    HID_USAGE ( 0x3c )                       ,\
+    HID_INPUT ( HID_DATA | HID_VARIABLE | HID_ABSOLUTE )    ,\
+    \
+    HID_REPORT_COUNT( 3                                      ) ,\
+    HID_REPORT_SIZE ( 1                                      ) ,\
+    HID_INPUT ( HID_CONSTANT )    ,\
+    /* X and Y coordinates */\
+    HID_USAGE_PAGE ( HID_USAGE_PAGE_DESKTOP )               ,\
+    HID_USAGE ( HID_USAGE_DESKTOP_X )                       ,\
+    HID_USAGE ( HID_USAGE_DESKTOP_Y )                       ,\
+    HID_LOGICAL_MIN ( 0 )                                   ,\
+    HID_LOGICAL_MAX_N ( 32767, 2 )                          ,\
+    HID_REPORT_SIZE ( 16 )                                  ,\
+    HID_REPORT_COUNT ( 2 )                                  ,\
+    HID_INPUT ( HID_DATA | HID_VARIABLE | HID_ABSOLUTE)     ,\
+  HID_COLLECTION_END                                        ,\
+HID_COLLECTION_END
+
+#endif /* USB_DESCRIPTORS_H_ */

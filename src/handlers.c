@@ -1,0 +1,611 @@
+/*
+ * This file is part of DeskHop (https://github.com/hrvach/deskhop).
+ * Copyright (c) 2025 Hrvoje Cavrak
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * See the file LICENSE for the full license text.
+ * Modified by Derek Reynolds, 2026, for deskhopplus.
+ */
+
+#include "main.h"
+
+/* =================================================== *
+ * ============  Hotkey Handler Routines  ============ *
+ * =================================================== */
+
+/* This is the main hotkey for switching outputs */
+void output_toggle_hotkey_handler(device_t *state, hid_keyboard_report_t *report) {
+    /* If switching explicitly disabled, return immediately */
+    if (state->switch_lock)
+        return;
+
+    state->active_output ^= 1;
+    set_active_output(state, state->active_output);
+};
+
+void _get_border_position(device_t *state, border_size_t *border) {
+    const output_t *output = &state->config.output[state->active_output];
+    const int position = dh_mouse_along_seam(
+        (dh_direction_t)output->border_direction,
+        (dh_mouse_coordinates_t){.x = state->pointer_x, .y = state->pointer_y});
+    /* One hotkey records either end of the range, selected by the midpoint. */
+    if (position > (MAX_SCREEN_COORD / 2))
+        border->end = position;
+    else
+        border->start = position;
+}
+
+void _screensaver_set(device_t *state, uint8_t value) {
+    if (CURRENT_BOARD_IS_ACTIVE_OUTPUT)
+        state->config.output[BOARD_ROLE].screensaver.mode = value;
+    else
+        (void)send_value(value, SCREENSAVER_MSG);
+};
+
+/* This key combo records switch y top coordinate for different-size monitors  */
+void screen_border_hotkey_handler(device_t *state, hid_keyboard_report_t *report) {
+    border_size_t *border = &state->config.output[state->active_output].border;
+    if (CURRENT_BOARD_IS_ACTIVE_OUTPUT) {
+        _get_border_position(state, border);
+        save_config(state);
+    }
+
+    (void)queue_packet((uint8_t *)border, SYNC_BORDERS_MSG, sizeof(border_size_t));
+};
+
+/* Puts the named board into firmware upgrade mode, from either board.
+
+   A hotkey only ever runs on the board hosting the physical keyboard, so a handler that
+   resets itself means "this board", not "board A" — and the keyboard moves, because pairing
+   a helper requires it on that helper's board. Both letters were inverted whenever it sat on
+   B (#124). Reading BOARD_ROLE is what makes the letters name the board. */
+void _fw_upgrade_board(uint8_t named_role) {
+    if (BOARD_ROLE == named_role)
+        request_bootsel(&global_state);
+    else
+        (void)send_value(ENABLE, FIRMWARE_UPGRADE_MSG);
+};
+
+/* This key combo puts board A in firmware upgrade mode */
+void fw_upgrade_hotkey_handler_A(device_t *state, hid_keyboard_report_t *report) {
+    _fw_upgrade_board(OUTPUT_A);
+};
+
+/* This key combo puts board B in firmware upgrade mode */
+void fw_upgrade_hotkey_handler_B(device_t *state, hid_keyboard_report_t *report) {
+    _fw_upgrade_board(OUTPUT_B);
+};
+
+/* This key combo prevents mouse from switching outputs */
+void switchlock_hotkey_handler(device_t *state, hid_keyboard_report_t *report) {
+    state->switch_lock ^= 1;
+    (void)send_value(state->switch_lock, SWITCH_LOCK_MSG);
+}
+
+/* This key combo toggles gaming mode */
+void toggle_gaming_mode_handler(device_t *state, hid_keyboard_report_t *report) {
+    state->gaming_mode ^= 1;
+    (void)send_value(state->gaming_mode, GAMING_MODE_MSG);
+};
+
+/* This key combo locks both outputs simultaneously */
+void screenlock_hotkey_handler(device_t *state, hid_keyboard_report_t *report) {
+    hid_keyboard_report_t lock_report = {0}, release_keys = {0};
+
+    for (int out = 0; out < NUM_SCREENS; out++) {
+        switch (state->config.output[out].os) {
+            case WINDOWS:
+            case LINUX:
+                lock_report.modifier   = KEYBOARD_MODIFIER_LEFTGUI;
+                lock_report.keycode[0] = HID_KEY_L;
+                break;
+            case MACOS:
+                lock_report.modifier   = KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_LEFTGUI;
+                lock_report.keycode[0] = HID_KEY_Q;
+                break;
+            default:
+                break;
+        }
+
+        if (BOARD_ROLE == out) {
+            queue_kbd_report(&lock_report, state);
+            release_all_keys(state);
+        } else {
+            (void)queue_remote_keyboard_report(&lock_report, DH_KEYBOARD_SYNTHESIZED);
+            (void)queue_remote_keyboard_report(&release_keys, DH_KEYBOARD_SYNTHESIZED);
+        }
+    }
+}
+
+/* Everything a wipe means on this board: the sector in flash, the copy the
+   firmware runs from, and the pairing secret that was cached out of it (#75),
+   followed by a pairing window (#267).
+   Both wipe paths go through here — the chord below and the peer board's
+   message — so a third one cannot arrive and forget half of it. */
+static void _wipe_local_config(device_t *state) {
+    wipe_config();
+    load_config(state);
+    channel_config_wiped();
+}
+
+/* When pressed, erases stored config in flash and loads defaults on both boards */
+void wipe_config_hotkey_handler(device_t *state, hid_keyboard_report_t *report) {
+    _wipe_local_config(state);
+    (void)send_value(ENABLE, WIPE_CONFIG_MSG);
+}
+
+/* When pressed, opens a pairing window on this board and on its peer, so the
+   keyboard can sit on either board (ADR-0014). */
+void pair_hotkey_handler(device_t *state, hid_keyboard_report_t *report) {
+    channel_open_pairing_window();
+    (void)send_value(ENABLE, PAIR_WINDOW_MSG);
+}
+
+/* When pressed, toggles the current mouse zoom mode state */
+void mouse_zoom_hotkey_handler(device_t *state, hid_keyboard_report_t *report) {
+    state->mouse_zoom ^= 1;
+    (void)send_value(state->mouse_zoom, MOUSE_ZOOM_MSG);
+};
+
+/* When pressed, enables the pong screensaver on active output */
+void enable_screensaver_pong_hotkey_handler(device_t *state, hid_keyboard_report_t *report) {
+    uint8_t desired_mode = state->config.output[BOARD_ROLE].screensaver.mode;
+
+    /* If the user explicitly asks for pong screensaver to be active, ignore config and turn it on */
+    if (desired_mode == DISABLED || desired_mode == JITTER)
+        desired_mode = PONG;
+
+    _screensaver_set(state, desired_mode);
+}
+
+/* When pressed, enables the jitter screensaver on active output */
+void enable_screensaver_jitter_hotkey_handler(device_t *state, hid_keyboard_report_t *report) {
+    uint8_t desired_mode = state->config.output[BOARD_ROLE].screensaver.mode;
+
+    /* If the user explicitly asks for jitter screensaver to be active, ignore config and turn it on */
+    if (desired_mode == DISABLED || desired_mode == PONG)
+        desired_mode = JITTER;
+
+    _screensaver_set(state, desired_mode);
+}
+
+/* When pressed, disables the screensaver on active output */
+void disable_screensaver_hotkey_handler(device_t *state, hid_keyboard_report_t *report) {
+    _screensaver_set(state, DISABLED);
+}
+
+/* Enter or leave the special configuration mode */
+void config_enable_hotkey_handler(device_t *state, hid_keyboard_report_t *report) {
+    /* If config mode is already active, skip this: the chord is the exit */
+    if (!state->config_mode_active) {
+        watchdog_hw->scratch[5] = MAGIC_WORD_1;
+        watchdog_hw->scratch[6] = MAGIC_WORD_2;
+    }
+
+    release_all_keys(state);
+
+    /* Entering reboots at once. Leaving withdraws the config drive's medium
+       first and reboots after a grace, so the host sees a media removal and
+       not a mounted volume under a vanished device (#229). */
+    if (state->config_mode_active)
+        config_exit_request(&state->config_exit, time_us_32());
+    else
+        state->reboot_requested = true;
+};
+
+
+/* ==================================================== *
+ * ==========  UART Message Handling Routines  ======== *
+ * ==================================================== */
+
+/* Function handles received keypresses from the other board */
+void handle_keyboard_uart_msg(uart_packet_t *packet, device_t *state) {
+    dh_keyboard_provenance provenance;
+    const uint8_t *payload;
+    if (!dh_keyboard_transport_decode(packet->type, packet->data, &provenance, &payload))
+        return;
+
+    hid_keyboard_report_t *report = (hid_keyboard_report_t *)payload;
+    hid_keyboard_report_t combined_report;
+
+    /* Update the keyboard state for the remote device  */
+    update_remote_kbd_state(state, report);
+
+    if (provenance == DH_KEYBOARD_SYNTHESIZED) {
+        /* Preserve the provenance of both halves of this full-state snapshot:
+           local physical modifiers are transformed, the injected lock chord
+           is not. */
+        hid_keyboard_report_t local_report;
+        combine_local_kbd_states(state, &local_report);
+        dh_keyboard_output_merge((const uint8_t *)&local_report,
+                                 (const uint8_t *)report,
+                                 &state->config.output[BOARD_ROLE].keymap,
+                                 state->config.output[BOARD_ROLE].swap_ctrl_gui,
+                                 (uint8_t *)&combined_report);
+        queue_kbd_report(&combined_report, state);
+    } else {
+        combine_kbd_states(state, &combined_report);
+        output_keyboard_report(&combined_report, provenance, state);
+    }
+    state->last_activity[BOARD_ROLE] = time_us_64();
+}
+
+/* Function handles received mouse moves from the other board */
+void handle_mouse_abs_uart_msg(uart_packet_t *packet, device_t *state) {
+    mouse_report_t *mouse_report = (mouse_report_t *)packet->data;
+    queue_mouse_report(mouse_report, state);
+
+    if (mouse_report->mode != BOOT_RELATIVE) {
+        state->pointer_x = mouse_report->x;
+        state->pointer_y = mouse_report->y;
+    }
+    state->mouse_buttons   = mouse_report->buttons;
+
+    state->last_activity[BOARD_ROLE] = time_us_64();
+}
+
+/* Function handles request to switch output  */
+void handle_output_select_msg(uart_packet_t *packet, device_t *state) {
+    state->active_output = packet->data[0];
+    state->last_switch_time = time_us_64(); // Lights the Status LED again (#283)
+    state->output_arrival_guard = DH_DIRECTION_NONE;
+    state->output_arrival_reverse = 0;
+    if (state->tud_connected)
+        release_all_keys(state);
+
+    restore_leds(state);
+    channel_output_changed(state->active_output);
+}
+
+void handle_cursor_place_msg(uart_packet_t *packet, device_t *state) {
+    const uint8_t query_id = packet->data[7];
+    if (query_id == 0) {
+        channel_place_cursor((uint8_t)BOARD_ROLE, packet->data[0], packet->data[1],
+                             packet->data[2], packet->data16[2]);
+        return;
+    }
+    if (!channel_place_cursor_correlated((uint8_t)BOARD_ROLE, packet->data[0],
+                                         packet->data[1], packet->data[2],
+                                         packet->data16[2], query_id)) {
+        uart_packet_t unavailable = {
+            .type = CURSOR_QUERY_UNAVAILABLE_MSG,
+            .data = {(uint8_t)BOARD_ROLE, query_id},
+        };
+        (void)queue_uart_packet(&unavailable, state);
+    }
+}
+
+/* On firmware upgrade message, reboot into the BOOTSEL fw upgrade mode */
+void handle_fw_upgrade_msg(uart_packet_t *packet, device_t *state) {
+    request_bootsel(state);
+}
+
+/* Enters BOOTSEL after a short grace, so the all-keys-up report the hotkey
+   sent ahead of it reaches the host first. Rebooting at once left the key
+   down on the OS, and it auto-repeated until the device went away (#273).
+   kick_watchdog_task does the reset. */
+void request_bootsel(device_t *state) {
+    if (state->bootsel_requested)
+        return; /* a repeat of the chord must not push the reset back */
+    state->bootsel_requested_at = time_us_32();
+    __compiler_memory_barrier();
+    state->bootsel_requested = true;
+}
+
+/* Comply with request to turn mouse zoom mode on/off  */
+void handle_mouse_zoom_msg(uart_packet_t *packet, device_t *state) {
+    state->mouse_zoom = packet->data[0];
+}
+
+void handle_boot_mouse_mode_msg(uart_packet_t *packet, device_t *state) {
+    state->boot_mouse_mode[OTHER_ROLE] = packet->data[0] != 0;
+}
+
+/* Process request to update keyboard LEDs */
+void handle_set_report_msg(uart_packet_t *packet, device_t *state) {
+    /* We got this via serial, so it's stored to the opposite of our board role */
+    state->keyboard_leds_desired[OTHER_ROLE] = packet->data[0];
+
+    /* If we have a keyboard we can control leds on, restore state if active */
+    if (global_state.keyboard_connected && !CURRENT_BOARD_IS_ACTIVE_OUTPUT)
+        restore_leds(state);
+}
+
+/* Process request to block mouse from switching, update internal state */
+void handle_switch_lock_msg(uart_packet_t *packet, device_t *state) {
+    state->switch_lock = packet->data[0];
+}
+
+/* Handle border syncing message that lets the other device know about monitor height offset */
+void handle_sync_borders_msg(uart_packet_t *packet, device_t *state) {
+    border_size_t *border = &state->config.output[state->active_output].border;
+
+    if (CURRENT_BOARD_IS_ACTIVE_OUTPUT) {
+        _get_border_position(state, border);
+        (void)queue_packet((uint8_t *)border, SYNC_BORDERS_MSG, sizeof(border_size_t));
+    } else
+        memcpy(border, packet->data, sizeof(border_size_t));
+
+    save_config(state);
+}
+
+/* When this message is received, flash the locally attached LED to verify serial comms */
+void handle_flash_led_msg(uart_packet_t *packet, device_t *state) {
+    blink_led(state);
+}
+
+/* The peer's keyboard pressed the pair chord */
+void handle_pair_window_msg(uart_packet_t *packet, device_t *state) {
+    channel_open_pairing_window();
+}
+
+/* When this message is received, wipe the local flash config */
+void handle_wipe_config_msg(uart_packet_t *packet, device_t *state) {
+    _wipe_local_config(state);
+}
+
+/* Update screensaver state after received message */
+void handle_screensaver_msg(uart_packet_t *packet, device_t *state) {
+    state->config.output[BOARD_ROLE].screensaver.mode = packet->data[0];
+}
+
+/* Process consumer control message */
+void handle_consumer_control_msg(uart_packet_t *packet, device_t *state) {
+    queue_cc_packet(packet->data, state);
+}
+
+/* Process system control message */
+void handle_system_control_msg(uart_packet_t *packet, device_t *state) {
+    queue_system_packet(packet->data, state);
+}
+
+/* Process request to store config to flash */
+void handle_save_config_msg(uart_packet_t *packet, device_t *state) {
+    if (!dh_hotkey_table_is_valid(state->config.hotkeys, DH_HOTKEY_ACTION_COUNT))
+        return;
+    prepare_hotkeys(state->config.hotkeys);
+    save_config(state);
+}
+
+/* Process request to reboot the board. In config mode this is the config
+   page's Exit button, and the host still has the config drive mounted, so it
+   leaves the two-step way (#229). Anywhere else — a reboot proxied to the peer
+   board, say — there is no drive, and the board reboots on the spot. */
+void handle_reboot_msg(uart_packet_t *packet, device_t *state) {
+    if (state->config_mode_active)
+        config_exit_request(&state->config_exit, time_us_32());
+    else
+        reboot();
+}
+
+/* Decapsulate and send to the other box */
+void handle_proxy_msg(uart_packet_t *packet, device_t *state) {
+    (void)queue_packet(&packet->data[1], (enum packet_type_e)packet->data[0], PACKET_DATA_LENGTH - 1);
+}
+
+/* Process relative mouse command */
+void handle_toggle_gaming_msg(uart_packet_t *packet, device_t *state) {
+    state->gaming_mode = packet->data[0];
+}
+
+/* Queue the current value of one mapped field. False when the response could
+   not be queued, which a Read All treats as "offer this field again next
+   pass" rather than as a field that has been sent (#156). */
+static bool queue_api_value(const field_map_t *map, device_t *state) {
+    uart_packet_t response = {.type = GET_VAL_MSG, .data = {[0] = (uint8_t)map->idx}};
+
+    memcpy(&response.data[1], ((uint8_t *)&global_state) + map->offset, map->len);
+    return queue_cfg_packet(&response, state);
+}
+
+/* Process api communication messages */
+void handle_api_msgs(uart_packet_t *packet, device_t *state) {
+    uint8_t value_idx = packet->data[0];
+    const field_map_t *map = get_field_map_entry(value_idx);
+
+    /* If we don't have a valid map entry, return immediately */
+    if (map == NULL)
+        return;
+
+    if (packet->type == SET_VAL_MSG) {
+        /* Not allowing writes to objects defined as read-only */
+        if (map->readonly)
+            return;
+
+        /* Write straight to the field's offset into the structure */
+        memcpy(((uint8_t *)&global_state) + map->offset, &packet->data[1], map->len);
+    }
+    else if (packet->type == GET_VAL_MSG) {
+        (void)queue_api_value(map, state);
+    }
+
+    /* With each GET/SET message, we reset the configuration mode timeout */
+    reset_config_timer(state);
+}
+
+/* Arm a walk over the field map. The responses leave one per HID queue drain
+   (handle_api_read_all_step below), not all at once, so a repeated or
+   overlapping request can never ask the queue for more than it holds (#156). */
+void handle_api_read_all_msg(uart_packet_t *packet, device_t *state) {
+    config_read_all_start(&state->config_read_all, (uint16_t)get_field_map_length());
+    reset_config_timer(state);
+}
+
+/* Hand the next field of a config Read All to the HID queue. Called from
+   process_hid_queue_task so the walk is paced by the drain itself: at most one
+   response is produced per report sent, whatever the page asks for. */
+void handle_api_read_all_step(device_t *state) {
+    uint16_t index;
+
+    /* Outside config mode the vendor slot belongs to the helper and every
+       config response is refused, so a walk left running would offer the same
+       field for ever. */
+    if (!state->config_mode_active) {
+        config_read_all_stop(&state->config_read_all);
+        return;
+    }
+
+    /* Only ever produce into an idle queue. A Read All is background traffic
+       and the drain stops entirely while the host is not ready for the report
+       at the head, so a walk that kept producing would fill all 256 slots and
+       leave none for the consumer-control and system reports that share them.
+       The old loop was self-limiting at one map's worth; this is what replaces
+       that limit, and it costs nothing when the drain is keeping up. */
+    if (!queue_is_empty(&state->hid_queue_out))
+        return;
+
+    if (!config_read_all_peek(&state->config_read_all, &index))
+        return;
+
+    if (queue_api_value(get_field_map_index(index), state))
+        config_read_all_sent(&state->config_read_all, index);
+}
+
+/* Return metadata (index 0xff) or one six-byte half of a chronological trace
+   record. Keeping this outside api_field_map avoids overflowing the HID queue. */
+void handle_cursor_trace_msg(uart_packet_t *packet, device_t *state) {
+    uart_packet_t response = {.type = CURSOR_TRACE_MSG};
+    const uint8_t index = packet->data[0];
+    response.data[0] = index;
+    if (index == UINT8_MAX) {
+        response.data[1] = (uint8_t)cursor_trace_count();
+        response.data[2] = DH_CURSOR_TRACE_CAPACITY;
+        response.data[3] = sizeof(dh_cursor_trace_record_t);
+    } else {
+        const uint8_t half = packet->data[1];
+        dh_cursor_trace_record_t record;
+        if (half > 1 || !cursor_trace_read(index, &record))
+            return;
+        response.data[1] = half;
+        memcpy(&response.data[2], ((const uint8_t *)&record) + half * 6u, 6u);
+    }
+    queue_cfg_packet(&response, state);
+    reset_config_timer(state);
+}
+
+/* Process request packet and create a response */
+void handle_request_byte_msg(uart_packet_t *packet, device_t *state) {
+    uint32_t address = packet->data32[0];
+
+    if (address >= STAGING_IMAGE_SIZE)
+        return;
+
+    /* Add requested data to bytes 4-7 in the packet and return it with a different type */
+    uint32_t data = *(uint32_t *)&ADDR_FW_RUNNING[address];
+    packet->data32[1] = data;
+
+    (void)queue_packet(packet->data, RESPONSE_BYTE_MSG, PACKET_DATA_LENGTH);
+}
+
+/* Process response message following a request we sent to read a byte */
+/* state->page_offset and state->page_number are kept locally and compared to returned values */
+void handle_response_byte_msg(uart_packet_t *packet, device_t *state) {
+    uint16_t offset = packet->data[0];
+    uint32_t address = packet->data32[0];
+
+    /* A word we never asked for. Nothing below is safe to run then: the
+       mismatch branch would abandon a UF2 drop the host is still writing, or
+       one already abandoned — and abandoning a dirty image with the peer board
+       gone does not return (#104). Silence is the whole response. */
+    if (!fw_upgrade_may_pull(&state->fw))
+        return;
+
+    if (address != state->fw.address) {
+        /* The pull has lost its place, so it is over. If pages had already
+           gone over the running image this hands the board to ROM recovery
+           rather than leaving it booting a half-written one (#90). */
+        abandon_firmware_upgrade(state);
+        return;
+    }
+    else {
+        /* Provide visual feedback of the ongoing copy by toggling LED for every sector */
+        if((address & 0xfff) == 0x000)
+            toggle_led();
+    }
+
+    /* Update checksum as we receive each byte */
+    if (address < STAGING_IMAGE_SIZE - FLASH_SECTOR_SIZE)
+        for (int i=0; i<4; i++)
+            state->fw.checksum = crc32_iter(state->fw.checksum, packet->data[4 + i]);
+
+    memcpy(state->page_buffer + offset, &packet->data32[1], sizeof(uint32_t));
+
+    /* Neeeeeeext byte, please! */
+    state->fw.address += sizeof(uint32_t);
+    state->fw.byte_done = true;
+
+    /* The pull just advanced, so the stall clock starts over (#90). */
+    fw_upgrade_progress(&state->fw, time_us_32());
+}
+
+/* Process a request to read a firmware package from flash */
+void handle_heartbeat_msg(uart_packet_t *packet, device_t *state) {
+    /* The slots are named and asserted in packet.h, shared with
+       heartbeat_output_task, which is what writes them. */
+    fw_image_id_t peers = {
+        .version  = packet->data16[HEARTBEAT_VERSION_SLOT16],
+        .checksum = packet->data32[HEARTBEAT_CHECKSUM_SLOT32],
+    };
+    fw_image_id_t ours = {
+        .version  = state->_running_fw.version,
+        .checksum = state->_running_fw.checksum,
+    };
+    state->boot_mouse_mode[OTHER_ROLE] =
+        (packet->data16[HEARTBEAT_OUTPUT_SLOT16] & HEARTBEAT_BOOT_MOUSE_BIT) != 0;
+    channel_peer_board_heartbeat((packet->data16[HEARTBEAT_OUTPUT_SLOT16] & HEARTBEAT_HELPER_BIT) != 0);
+
+    /* Remember it, so this board can be asked what its peer is running (#89).
+       The checksum comes along because at equal version it is the only thing
+       that distinguishes two builds (#91). Recorded before the upgrade check
+       below returns, since a heartbeat that arrives mid-upgrade is still proof
+       the peer is there. */
+    peer_fw_record(&state->peer_fw, peers.version, peers.checksum, time_us_64());
+
+    /* Newer peer board, or the same version carrying a different image — the
+       second being what kills the version tax on the dev loop (#91). Board B
+       follows board A and never the other way round, so two boards that
+       disagree at one version cannot both start pulling; fw_upgrade.h has the
+       whole rule. Asking unconditionally is safe: a transfer already running
+       answers no. */
+    if (!fw_upgrade_should_pull(&state->fw, ours, peers, state->board_role == OUTPUT_B))
+        return;
+
+    /* It is? Ok, kick off the firmware upgrade.
+
+       Set field by field rather than assigning a fresh struct: image_dirty has
+       to survive this, or a restart would forget that the running image is
+       half-written and that a peer board going away mid-repair is the one case
+       that must be loud (#90). Starting the stall clock here matters for the
+       same reason a zeroed one would not do — it would read as quiet since
+       boot. */
+    state->fw.upgrade_in_progress = true;
+    state->fw.source              = FW_UPGRADE_SOURCE_PULL;
+    state->fw.byte_done           = true;
+    state->fw.address             = 0;
+    state->fw.checksum            = 0xffffffff;
+    fw_upgrade_progress(&state->fw, time_us_32());
+}
+
+
+/* ==================================================== *
+ * ==============  Output Switch Routines  ============ *
+ * ==================================================== */
+
+/* Update output variable, set LED on/off, notify the other board so they are in sync, and
+   tell this board's helper the user arrived if its computer is now active (#250). */
+void set_active_output(device_t *state, uint8_t new_output) {
+    state->active_output = new_output;
+    state->last_switch_time = time_us_64(); // Lights the Status LED again (#283)
+    state->output_arrival_guard = DH_DIRECTION_NONE;
+    state->output_arrival_reverse = 0;
+    restore_leds(state);
+    (void)send_value(new_output, OUTPUT_SELECT_MSG);
+    channel_output_changed(new_output);
+
+    /* If we were holding a key down and drag the mouse to another screen, the key gets stuck.
+       Changing outputs = no more keypresses on the previous system. */
+    release_all_keys(state);
+}

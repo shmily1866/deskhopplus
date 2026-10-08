@@ -1,0 +1,420 @@
+/* The config page as a settings window: sidebar, toolbar, grouped rows.
+   Tokens first; dark follows the OS. Everything is inline and hand-written
+   because the page ships on a 64 kB disk with no network (PRODUCT.md). */
+
+:root {
+  --ground: #ececec;
+  --pane: #f5f5f7;
+  --box: #ffffff;
+  --well: #e4e4e8;
+  --line: #d2d2d7;
+  --ink: #1d1d1f;
+  --ink-2: #6e6e73;
+  --accent: #0a60ff;
+  --on-accent: #ffffff;
+  --monitor: #c7c7cc;
+  --monitor-ink: #3a3a3c;
+  --handle: #4a4a4e;
+  --warn: #ffd60a;
+  --warn-ink: #1d1d1f;
+  --bad: #d70015;
+  --focus: #0a60ff66;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #1e1e1e;
+    --pane: #2a2a2c;
+    --box: #353538;
+    --well: #232325;
+    --line: #48484c;
+    --ink: #f2f2f7;
+    --ink-2: #a1a1a6;
+    --accent: #2f6fe0;
+    --monitor: #5a5a5f;
+    --monitor-ink: #f2f2f7;
+    --handle: #5a5a5f;
+    --warn: #ffd60a;
+    --warn-ink: #1d1d1f;
+    --bad: #ff6961;
+    --focus: #2f6fe080;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { height: 100%; }
+
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--pane);
+  color: var(--ink);
+  font: 13px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
+  accent-color: var(--accent);
+}
+
+::selection { background: var(--accent); color: var(--on-accent); }
+
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 1px; }
+
+/* Window: sidebar and pane */
+
+.window { display: flex; min-height: 100vh; }
+
+.sidebar {
+  flex: 0 0 220px;
+  padding: 16px 12px;
+  background: var(--ground);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar h1 {
+  margin: 0 8px 14px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar button {
+  text-align: left;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  position: relative;
+}
+
+.sidebar button:hover { background: color-mix(in srgb, var(--ink) 8%, transparent); }
+
+.sidebar button[aria-current="page"] { background: var(--accent); color: var(--on-accent); }
+
+/* A section holding unsaved changes or an invalid field says so with a dot. */
+.sidebar button[data-unsaved]::after {
+  content: "";
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.pane { flex: 1 1 auto; min-width: 0; }
+
+main { padding: 8px 24px 40px; max-width: 760px; }
+
+#fields { margin: 0; padding: 0; border: 0; min-width: 0; }
+
+section[data-section][hidden] { display: none; }
+
+/* Toolbar */
+
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 44px;
+  padding: 0 24px;
+  background: var(--pane);
+  border-bottom: 1px solid var(--line);
+}
+
+.toolbar p { margin: 0; color: var(--ink-2); }
+
+#connection[data-on="1"] { color: var(--ink); }
+
+#menu-buttons { display: flex; gap: 8px; }
+
+button, select, input, textarea { font: inherit; color: inherit; }
+
+.toolbar button, #service-buttons button, .layout-counts button, .row button {
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--box);
+  cursor: pointer;
+}
+
+.toolbar button:hover, #service-buttons button:hover, .layout-counts button:hover, .row button:hover {
+  background: color-mix(in srgb, var(--box) 85%, var(--ink));
+}
+
+.toolbar button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+
+.toolbar button.primary:hover { background: color-mix(in srgb, var(--accent) 85%, black); }
+
+button:disabled { opacity: 0.45; cursor: default; }
+
+button:disabled:hover { background: var(--box); }
+
+.toolbar button.primary:disabled:hover { background: var(--accent); }
+
+#unsaved { margin-left: 6px; padding: 0 6px; border-radius: 8px; background: var(--on-accent); color: var(--accent); font-size: 11px; }
+
+#service-buttons button[data-armed] { background: var(--warn); border-color: var(--warn); color: var(--warn-ink); }
+
+/* Refusal and browser warning strips */
+
+.strip {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 16px 24px 0;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--warn);
+  color: var(--warn-ink);
+}
+
+.strip[hidden] { display: none; }
+
+.strip svg { flex: none; margin-top: 2px; }
+
+.strip strong { font-weight: 600; }
+
+.strip ul { margin: 6px 0 0; padding-left: 18px; }
+
+.strip a { color: inherit; font-weight: 600; }
+
+/* Sections and rows */
+
+h2 { margin: 20px 0 12px; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+
+h3 { margin: 24px 0 8px; font-size: 13px; font-weight: 600; }
+
+/* A group title sits above its box, as the OS sets them. */
+h3.sub { margin: 18px 0 6px 14px; font-size: 11px; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.04em; }
+
+h3.sub:first-child { margin-top: 8px; }
+
+.hint { margin: 8px 0 0; max-width: 72ch; color: var(--ink-2); font-size: 12px; }
+
+.group {
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--box);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  min-height: 40px;
+  padding: 6px 14px;
+  margin: 0;
+}
+
+.row + .row { border-top: 1px solid var(--line); }
+
+.group + .group { margin-top: 12px; }
+
+.row > label, .row > span:first-child { flex: 1 1 160px; }
+
+.row > small { flex-basis: 100%; }
+
+.row > .timer-hint { flex-basis: 100%; color: var(--ink-2); font-size: 12px; }
+
+.row input[type="text"], .row input[type="number"], .row textarea, .row select {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--pane);
+  min-width: 0;
+}
+
+/* Wide enough for a six-key chord such as lctrl+rshift+lalt+ralt+capslock+f12. */
+.row input[type="text"] { width: 260px; }
+
+.row input[type="number"] { width: 100px; }
+
+.row input[type="number"][data-scale] { width: 148px; font-variant-numeric: tabular-nums; }
+
+.row input[readonly] { background: transparent; border-color: transparent; text-align: right; color: var(--ink-2); }
+
+.row input[readonly].content { font-variant-numeric: tabular-nums; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+
+.row input[readonly].dev-warning { color: var(--bad); }
+
+.row textarea { width: 280px; resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+
+.row select {
+  appearance: none;
+  padding-right: 24px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+
+.row input[aria-invalid], .row textarea[aria-invalid] { border-color: var(--bad); }
+
+.hotkey-error, .keymap-error, .timer-error { color: var(--bad); font-size: 12px; }
+
+.hotkey-error:empty, .keymap-error:empty, .timer-error:empty { display: none; }
+
+/* Switch: a checkbox drawn as the OS draws one. */
+.switch {
+  appearance: none;
+  width: 34px;
+  height: 20px;
+  margin: 0;
+  border-radius: 10px;
+  background: var(--monitor);
+  position: relative;
+  cursor: pointer;
+  transition: background 120ms ease-out;
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+  transition: left 120ms ease-out;
+}
+
+.switch:checked { background: var(--accent); }
+
+.switch:checked::after { left: 16px; }
+
+/* Slider with its readout */
+.slider { display: flex; align-items: center; gap: 10px; }
+
+.slider .readout { width: 48px; text-align: right; border: 0; background: transparent; padding: 0; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+
+.slider .range { width: 160px; margin: 0; }
+
+.seam-inputs { display: flex; gap: 8px; }
+
+.seam-inputs label { display: flex; align-items: center; gap: 4px; color: var(--ink-2); font-size: 12px; }
+
+.seam-inputs input { width: 72px; }
+
+/* Advanced: a disclosure line; its content is titled boxes like the rest. */
+#advanced { margin-top: 18px; }
+
+summary { padding: 6px 0; cursor: pointer; font-weight: 600; width: max-content; }
+
+pre {
+  margin: 0;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  font: 11px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ink-2);
+}
+
+/* The layout well and the picture in it */
+
+/* The well is the page's peak: the desk fills it, everything else is quiet. */
+.well {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 460px;
+  padding: 24px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--well);
+  text-align: center;
+}
+
+#layout { color: var(--ink-2); overflow-x: auto; }
+
+/* layout.js caps the height inline at the canvas size; the well overrides
+   that so the desk is drawn at hero scale, not as a thumbnail. */
+#layout svg { display: block; margin: 0 auto; width: 100%; max-width: 100%; max-height: 380px !important; }
+
+#layout-status { margin: 8px 0 0; min-height: 1.45em; color: var(--bad); }
+
+#layout-status.layout-ok { color: var(--ink-2); }
+
+#layout-status:empty { margin: 0; min-height: 0; }
+
+.layout-counts { margin: 16px 0 0; display: flex; justify-content: center; gap: 32px; color: var(--ink); }
+
+.layout-counts button { padding: 0 12px; line-height: 26px; font-size: 15px; }
+
+.layout-handle { cursor: grab; }
+
+.layout-handle rect { fill: var(--handle); }
+
+/* 10px regular: a one-monitor bar must still hold "B · Windows" in Linux Chrome's wider fonts (CI). */
+.layout-handle text { fill: #fff; font-size: 10px; text-anchor: middle; pointer-events: none; }
+
+.layout-box { cursor: grab; outline: none; }
+
+.layout-monitor { fill: var(--monitor); stroke: var(--monitor-ink); stroke-width: 1.5; transition: fill 120ms ease-out; }
+
+.layout-main { stroke-width: 3; }
+
+.layout-box text { fill: var(--monitor-ink); font-size: 13px; font-weight: 600; text-anchor: middle; pointer-events: none; }
+
+.layout-box:focus-visible .layout-monitor { stroke: var(--accent); }
+
+#layout[data-selected="A"] .layout-A .layout-monitor,
+#layout[data-selected="B"] .layout-B .layout-monitor { fill: var(--accent); stroke: var(--accent); }
+
+#layout[data-selected="A"] .layout-A .layout-main,
+#layout[data-selected="B"] .layout-B .layout-main { stroke: var(--on-accent); }
+
+#layout[data-selected="A"] .layout-A text,
+#layout[data-selected="B"] .layout-B text { fill: var(--on-accent); }
+
+#layout[data-selected="A"] .layout-A .layout-handle rect,
+#layout[data-selected="B"] .layout-B .layout-handle rect { fill: var(--accent); }
+
+/* Segments: ink bands with well-coloured numbers, so both schemes stay in the one-accent palette. */
+.layout-band { stroke: var(--monitor-ink); stroke-width: 8; stroke-linecap: round; }
+
+.layout-band-number { fill: var(--well); paint-order: stroke; stroke: var(--monitor-ink); stroke-width: 4px; font-size: 12px; font-weight: 700; text-anchor: middle; pointer-events: none; }
+
+/* Narrow window: the sidebar folds into a row of section names. */
+@media (max-width: 800px) {
+  .window { flex-direction: column; }
+  .sidebar { flex: none; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px; padding: 10px 12px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .sidebar h1 { flex-basis: 100%; margin: 0 8px 6px; }
+  .toolbar { position: static; flex-wrap: wrap; height: auto; min-height: 44px; padding: 6px 16px; }
+  main { padding: 8px 16px 40px; }
+  .strip { margin: 12px 16px 0; }
+  .row input[type="text"], .row textarea { width: 100%; }
+  .slider .range { width: 120px; }
+  .layout-counts { flex-wrap: wrap; gap: 12px; }
+}
+
+/* Phone width: nothing in a row is wider than the row. */
+@media (max-width: 480px) {
+  .slider, .seam-inputs { flex: 1 1 100%; flex-wrap: wrap; }
+  .slider .range { flex: 1 1 120px; }
+  .row input[type="number"] { width: 80px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch, .switch::after, .layout-monitor { transition: none; }
+}

@@ -1,0 +1,182 @@
+# ADR-0004: Independent bidirectional liveness, carried by traffic rather than by acknowledgement
+
+- **Status:** Accepted
+- **Date:** 2026-08-11
+- **Resolves:** [#68](https://github.com/myn/deskhopplus/issues/68)
+- **Constrains:** [#52](https://github.com/myn/deskhopplus/issues/52) and the clipboard slices, [#49](https://github.com/myn/deskhopplus/issues/49) (the Windows helper), and the session section of spec [#42](https://github.com/myn/deskhopplus/issues/42)
+- **Related:** [#69](https://github.com/myn/deskhopplus/issues/69) — the single outbound frame slot this decision is shaped around
+
+## Decision
+
+Liveness on the channel is **symmetric and independently timed in each direction**, and it is
+carried by **any traffic**, not by an acknowledgement.
+
+- Each end considers its peer alive while **any frame** has arrived from it inside
+  `DH_SESSION_ABSENT_MS` (three heartbeat intervals). Traffic in a direction is itself the proof,
+  in **both** directions and with nothing excluded — clipboard bulk and a refused hello count as
+  much as a heartbeat does. Crediting only heartbeats at either end would evict a peer in the
+  middle of its own traffic, because that peer suppresses its beat exactly when it is busiest.
+- A heartbeat is emitted **only when that direction has been idle** for a full interval. It is a
+  filler for a quiet link, not the liveness signal. A busy link emits none at all.
+- `DEVICE_HEARTBEAT` (`0x06`, d→h, empty) is added so the device→helper direction has a filler of
+  its own. It is sent only while a session exists, so its absence is meaningful.
+- `SESSION_END` (`0x07`, d→h, `reason:u8`) is added so the device can announce an eviction it knows
+  about, rather than leaving the helper to wait out a timeout. It is an **optimisation over** the
+  timeout and never a substitute: a device that reboots or wedges announces nothing.
+
+Both ids sit in the session band, so the firmware never forwards them and the routing decision
+stays a single range test.
+
+## Context
+
+The v1 heartbeat was one-way. A helper beat every second and the device refreshed a timestamp;
+nothing travelled back. The device drops a session on three paths that send nothing — its own
+liveness timeout, a framing error on its reader, and a version mismatch. On the first two the
+helper went on beating into a device that ignores heartbeats, with no ack to miss and no re-hello
+timer, and its menu bar kept reading *connected and paired*.
+
+A fourth path was claimed during the design session and is **not** a defect: the config chord
+calls `dh_session_drop` in `channel_open_pairing_window`, but that function's only caller is
+`setup.c`, on the normal-mode boot *after* the chord's reboot, where `channel_init` has just
+cleared the session and no helper has yet said hello. The helper learns of that eviction from the
+USB re-enumeration, which is a louder signal than any frame. Recorded here because the claim
+reached the issue and this ADR before it was checked, and because a `re_paired` reason code
+briefly existed to serve it. That code and its golden vector were removed rather than reserved:
+a wire format should not carry a value nothing emits, held open for a caller that does not exist.
+If the window ever becomes openable while a session is live, the reason is one line to add back,
+in the same change that makes it reachable.
+
+The cost of the gap rises sharply at the first payload. Cursor placement degrading quietly is
+survivable; a helper that believes it holds a session it does not will offer clipboard content that
+never arrives, and the paste side will wait on a transfer nobody is sending. Hence settled before
+#52 rather than after.
+
+## Why acknowledgement lost
+
+The obvious mechanism — the device answers each beat — was rejected for a reason worth recording,
+because it is the option a future reader will assume was correct.
+
+**An acknowledgement only proves anything while the helper is still asking.** The first failure
+path is a helper whose own beats *stalled rather than stopped*; that helper has stopped asking, so
+it never notices the missing answers. The mechanism is blind to one of the exact cases motivating
+it. Two free-running timers have no such hole: each end is watching for something the other end
+sends unprompted.
+
+## Why traffic rather than a dedicated beat
+
+This is the part that will look wrong at a glance, since #68 itself rejected "treat existing
+traffic as liveness" on its face. That rejection was correct **in the helper→device direction**,
+where placement is fire-and-forget and may not happen for hours, so absence proves nothing. The
+inverse proposition is what is used here: the *presence* of a device→helper frame proves the device
+is alive and holds an authenticated session, because every such frame either came from the session
+layer itself or is one the device authenticated to this helper before emitting it.
+
+(That last clause was `dh_session_may_relay` — one flag for the whole board — until
+[ADR-0008](0008-channel-identity-and-sealed-clipboard.md) replaced it with a tag on every frame
+(#111). The property this argument rests on is unchanged and is now stronger: a device→helper frame
+carries a tag under the session key, so it could only have come from the device holding it. The
+helper→device direction changed in the same way, and there it is a fix rather than a restatement —
+under v1 the deadline measured "*something* is writing", which on a shared endpoint (#95) let a
+second writer hold the device's view of the helper alive after the real helper had stopped.)
+
+The forcing constraint is `channel_queue_frame`: **one frame slot**, shared by relayed bulk, and a
+refusal is silent loss with no retransmit beneath it (#69). A once-per-second beat competing with a
+sustained clipboard transfer would be refused repeatedly, three refusals is a false eviction, the
+transfer is abandoned, and the reconnect starts a transfer that dies the same way. A beat that
+fires only on an idle link **fabricates none of this**: a busy link emits no beat at all, and a
+refused beat is self-correcting, because the slot being busy means something else is going out that
+refreshes the peer anyway.
+
+So the mechanism designed to detect a broken session would, in its obvious form, have manufactured
+broken sessions — and only once #52 landed, which is the deadline it was written to beat.
+
+## Alternatives considered
+
+| Option | Why not |
+| --- | --- |
+| **Acknowledged heartbeat** — the device answers each beat | Blind to a helper whose beats stall rather than stop, which is the first of the four failure paths. Also a strict 1:1 obligation inside the frame handler, and one guaranteed frame per second per direction contending for the single out slot. |
+| **Dedicated device beat, sent unconditionally** | Contends with relayed bulk for the one outbound slot; refusals are silent, and three of them is a false eviction mid-transfer. Idle-gating it costs one timestamp and removes the failure mode entirely. |
+| **Reuse existing traffic *instead of* a beat** | Rejected in both directions. Placement is fire-and-forget and may be hours apart, so *silence* proves nothing — which is what the idle-gated beat is for. Note this rejects traffic as a *substitute* for the beat, not traffic as proof of life: arrival still refreshes the deadline, in both directions. Conflating the two is what #68's original framing did, and it is why the first implementation credited only heartbeats on the device side. |
+| **`SESSION_END` as the mechanism, with no timeout** | A device that reboots, wedges, or loses power announces nothing. Announcement is an optimisation on top of a timeout, never in place of one. |
+| **Hoist the helper session engine into the shared core** so #49 inherits the detector | After idle-gating, the detector is one comparison against a constant the core already exports. A C module wrapping it would be worse code than the duplication it prevents. The larger question — whether all of the helper's session logic belongs in C — is real but far bigger than #68, and is tracked separately. |
+
+## Consequences
+
+- **The heartbeat becomes conditional in both directions.** Existing helper tests that assert a
+  beat at exactly `heartbeatInterval` become "a beat only if nothing else was sent."
+- **`dh_session_tick` stops returning `bool`.** The eviction transition *is* the emitted
+  `SESSION_END`, so the signal and the frame are one thing that cannot disagree. `dh_session_drop`
+  splits: a silent form for a lost link, where there is nobody to tell, and `dh_session_end`, which
+  drops and encodes.
+- **The detector is scoped to a session, never to a phase.** A helper refused authentication stays
+  connected, beating and asking, because #46's silent provisioning only works on a helper that is
+  connected when the chord lands. Keying the detector on the phase would tear that down every three
+  seconds and break pairing outright.
+- **`DH_PROTO_VERSION` does not change.** v1 is unreleased, the registry change is additive, and
+  the version check is exact equality, so a bump would only force a mismatch nothing benefits from.
+- **#52 inherits a seam**, not a condition to invent: bulk may be sent only while a session is
+  established, exposed once and tested here.
+- **#49 inherits the constants and the wire format**, which is all there is to inherit; #68's
+  acceptance criterion was amended to say so.
+- The glossary (`CONTEXT.md`) now separates **Link**, **Connection** and **Session**. Having one
+  word for all three is why this defect was invisible: a dead session and a live connection look
+  identical when you cannot name the difference.
+
+## Amendment, 2026-08-25 — the idle timer belongs to what actually went out
+
+The rule above says a heartbeat is emitted only when that direction has been idle for a full
+interval. It did not say *who decides the direction carried something*, and the two ends of the
+helper answered differently.
+
+The clipboard path charged the idle timer only for a frame the transport had taken, and said so at
+the call site: *"Charging for one it refused would suppress a beat that ADR-0004 owed the board."*
+The session path — which is where the beat itself is — charged it at **build** time, inside
+`dh_helper_tick`, before the platform had been asked. Both helpers then discarded their transport's
+answer for session frames, so a refused beat was silently lost **and** bought a full interval of
+silence it had not earned.
+
+The board evicts a helper after `DH_SESSION_ABSENT_MS`, which is three intervals. Three refusals in
+a row therefore ends the session, with nothing at either end able to say why.
+
+**That is a defect in its own right and is not claimed to be
+[#107](https://github.com/myn/deskhopplus/issues/107)'s cause.** #107's evictions run from 0.2 s to
+6,811 s apart, and the low end of that cannot be an idle timeout at all: `DH_SESSION_ABSENT_MS` is a
+3,000 ms floor, `last_seen_ms` is set where the session is established and only one code path sets
+`present`, so no idle timer can evict a session younger than three seconds. Two in the current log
+were evicted at 1.2 s and 2.0 s of age. Whatever that is, it is not this.
+
+**One rule now, in one place:** `dh_helper_note_sent` is what charges the timer, and the beat is not
+exempt. `dh_helper_tick` builds the beat and stops there. The hello and the pair request still
+charge at build time, deliberately — each has its own timeout and re-sends itself, where the beat
+has nothing behind it.
+
+A platform that never charges the timer beats on every tick. That is the safe direction to fail
+in — noisy rather than silent — and it is why this is a removal rather than a callback. On macOS
+`ChannelTransport.send` also loses its `@discardableResult`, so the compiler now refuses a caller
+that ignores whether a frame went out.
+
+**This does not close #107 on its own.** The measured symptom is the board timing the helper out at
+irregular intervals, and nothing yet shows this defect firing on hardware. What ships beside the fix
+is the reading that would show it: `DH_NOTE_SESSION_ENDED` now carries how long this helper had gone
+without getting a frame out, so a liveness end says whether the two ends agree about the silence.
+They disagreeing means frames are being lost between them; they agreeing means the helper really did
+stall, and those are different faults.
+
+## Amendment, 2026-08-27 — the heartbeat trace follows liveness evidence
+
+The helper's diagnostic originally timed the gap since the last literal `DEVICE_HEARTBEAT`. That
+contradicted the decision above: authenticated traffic deliberately suppresses the idle filler and
+replaces it as proof of liveness. A sustained transfer therefore produced `device heartbeat quiet`
+and `resumed` lines while the device was continuously proving that it was alive. Hardware validation
+for [#144](https://github.com/myn/deskhopplus/issues/144) reproduced the false pair on both helpers
+with zero outbound refusals and no session loss; the same pair also appeared during ordinary idle
+use when other authenticated traffic crossed the channel.
+
+Once the first literal beat establishes the trace, **any authenticated device frame advances its
+evidence clock**, exactly as it advances the session's liveness clock. A later idle filler is not a
+resumption from a fault: the direction remained live, and the filler was not owed while traffic
+crossed it. Unauthenticated traffic still advances neither clock.
+
+This does not weaken the silence detector. `last_device_frame_at` remains the authoritative timeout,
+and a direction carrying neither traffic nor its idle filler still ends the connection after
+`DH_SESSION_ABSENT_MS`.

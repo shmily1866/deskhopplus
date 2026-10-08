@@ -1,0 +1,153 @@
+/*
+ * This file is part of DeskHop (https://github.com/hrvach/deskhop).
+ * Copyright (c) 2025 Hrvoje Cavrak
+ * Based on the TinyUSB example by Ha Thach.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * See the file LICENSE for the full license text.
+ * Modified by Derek Reynolds, 2026, for deskhopplus.
+ */
+
+#include "main.h"
+
+#define NUMBER_OF_BLOCKS 4096
+#define ACTUAL_NUMBER_OF_BLOCKS 128
+#define BLOCK_SIZE       512
+
+void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4]) {
+    strcpy((char *)vendor_id, "DeskHop");
+    strcpy((char *)product_id, "Config Mode");
+    strcpy((char *)product_rev, "1.0");
+}
+
+/* False once config mode is leaving or the host has ejected: TinyUSB then
+   answers NOT READY / MEDIUM NOT PRESENT, and the host tears the volume down
+   while the device stays enumerated (#229). */
+bool tud_msc_test_unit_ready_cb(uint8_t lun) {
+    return config_exit_medium_present(&global_state.config_exit);
+}
+
+void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size) {
+    *block_count = NUMBER_OF_BLOCKS;
+    *block_size  = BLOCK_SIZE;
+}
+
+/* Load/eject with start clear is the host's eject: Finder's eject button,
+   Windows "Safely remove", Linux `eject`. The medium is gone from here on,
+   and a later exit need not wait for the host (#229). */
+bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject) {
+    if (load_eject && !start)
+        config_exit_host_ejected(&global_state.config_exit);
+
+    return true;
+}
+
+/* Return the requested data, or -1 if out-of-bounds */
+int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
+    const uint8_t *addr = &ADDR_DISK_IMAGE[lba * BLOCK_SIZE + offset];
+
+    if (lba >= NUMBER_OF_BLOCKS)
+        return -1;
+
+    /* We lie about the image size - actually it's 64 kB, not 512 kB, so if we're out of bounds, return zeros */
+    else if (lba >= ACTUAL_NUMBER_OF_BLOCKS)
+        memset(buffer, 0x00, bufsize);
+
+    else
+        memcpy(buffer, addr, bufsize);
+
+    return (int32_t)bufsize;
+}
+
+/* We're writable, so return true */
+bool tud_msc_is_writable_cb(uint8_t lun) {
+    return true;
+}
+
+/* Simple firmware write routine, we get 512-byte uf2 blocks with 256 byte payload */
+int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
+    const uint32_t MAX_BLOCK_NO = (STAGING_IMAGE_SIZE / FLASH_PAGE_SIZE) - 1;
+    uf2_t *uf2 = (uf2_t *)&buffer[0];
+
+    bool is_final_block = (uf2->blockNo == MAX_BLOCK_NO);
+    uint32_t flash_addr = (uint32_t)ADDR_FW_RUNNING + uf2->blockNo * FLASH_PAGE_SIZE - XIP_BASE;
+
+    if (lba >= NUMBER_OF_BLOCKS)
+        return -1;
+
+    /* If we're not detecting UF2 magic constants, we have nothing to do... */
+    if (uf2->magicStart0 != UF2_MAGIC_START0 || uf2->magicStart1 != UF2_MAGIC_START1 || uf2->magicEnd != UF2_MAGIC_END)
+        return (int32_t)bufsize;
+
+    /* The block number is the host's, and until #111 nothing bounded it —
+       MAX_BLOCK_NO was computed and then used only to spot the last block.
+       Unchecked it is an absolute page address into flash: a UF2 naming block
+       0x1F80 writes 2048k-8k, which is the board's identity sector, and
+       write_flash_page erases a sector before programming it. One oversized or
+       malformed image would therefore destroy the identity and unpair every
+       helper registered against it — the identity is placed outside the image
+       precisely so that a firmware update cannot do that, and this is what
+       makes the placement true rather than merely intended
+       (src/include/flash_layout.h, tests/flash_layout_test.c).
+
+       Refused rather than clamped: a block past the image means the image is
+       not the one this board takes, and half-writing it is what
+       abandon_firmware_upgrade exists to recover from (#90). */
+    if (uf2->blockNo > MAX_BLOCK_NO)
+        return -1;
+
+    if (uf2->blockNo == 0) {
+        global_state.fw.checksum = 0xffffffff;
+
+        /* Make sure nobody else touches the flash during this operation, otherwise we get empty pages */
+        global_state.fw.upgrade_in_progress = true;
+
+        /* Which is exactly what this says, and what the flag alone could not:
+           the host is writing the image, so the pull must not also be asking
+           the peer board for it (#104). */
+        global_state.fw.source = FW_UPGRADE_SOURCE_DROP;
+    }
+
+    /* Update checksum continuously as blocks are being received */
+    const uint32_t last_block_with_checksum = (STAGING_IMAGE_SIZE - FLASH_SECTOR_SIZE) / FLASH_PAGE_SIZE;
+    for (int i=0; i<FLASH_PAGE_SIZE && uf2->blockNo < last_block_with_checksum; i++)
+        global_state.fw.checksum = crc32_iter(global_state.fw.checksum, buffer[32 + i]);
+
+    write_flash_page(flash_addr, &buffer[32]);
+
+    /* The running image is now part-old and part-new, and the drop has just
+       advanced. A host that stops writing partway through must not leave the
+       board booting what it wrote (#90). */
+    global_state.fw.image_dirty = true;
+    fw_upgrade_progress(&global_state.fw, time_us_32());
+
+    if (is_final_block) {
+        global_state.fw.checksum = ~global_state.fw.checksum;
+
+        /* If checksums don't match, overwrite first sector and rely on ROM bootloader for recovery */
+        if (global_state.fw.checksum != calculate_firmware_crc32())
+            recover_to_rom();
+        else {
+            /* The image is whole again, so nothing is left to repair. Reboot
+               into it through the two-step exit, so the host's copy ends with
+               a media removal rather than a vanished device (#229). */
+            global_state.fw.image_dirty = false;
+            config_exit_request(&global_state.config_exit, time_us_32());
+        }
+    }
+
+    /* Provide some visual indication that fw is being uploaded */
+    toggle_led();
+    watchdog_update();
+
+    return (int32_t)bufsize;
+}
+
+/* This is a super-dumb, rudimentary disk, any other scsi command is simply rejected */
+int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, uint16_t bufsize) {
+    tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
+    return -1;
+}

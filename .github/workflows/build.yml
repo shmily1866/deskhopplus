@@ -1,0 +1,375 @@
+# Modified by Derek Reynolds, 2026, for deskhopplus.
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    # A v* tag runs the same three builds and then the release job (#203).
+    tags:
+      - 'v*'
+  pull_request:
+    branches: 
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # This job runs in about two minutes. The cap is here because installing the
+    # ARM toolchain is the one step that has hung outright (run #30, 14 minutes
+    # and still going), and an unbounded hang costs far more than a fast failure.
+    timeout-minutes: 25
+    steps:
+
+    # No apt-get update. The runner's package lists already resolve everything
+    # here, and refreshing them re-fetches a dozen third-party indexes — azure-cli,
+    # microsoft prod, google chrome — that this build has no use for. Adding it
+    # was pure cost.
+    #
+    # Do NOT add --no-install-recommends here. The C++ standard library for
+    # arm-none-eabi arrives as a *recommend* of the packages below, and the
+    # build needs it: the project declares CXX and the SDK compiles
+    # pico_standard_link/new_delete.cpp. Run #33 tried the flag and failed with
+    # "fatal error: cstdlib: No such file or directory".
+    #
+    # Naming a C++ package explicitly instead is a trap: there is no
+    # g++-arm-none-eabi on Ubuntu (run #34 died on "Unable to locate package"),
+    # because the compiler is in gcc-arm-none-eabi and only the library is
+    # packaged separately. This list is the one that has always worked.
+    #
+    # No python3-venv either: webconfig/Makefile prefers a system interpreter that
+    # already has jinja2, and this runner has one, so the render takes 0s and
+    # never builds a venv. If a future runner does need one, the render step says
+    # so plainly rather than failing obscurely.
+    #
+    # Bounded and retried, because this is the step that hangs. Run #30 sat here
+    # for 14 minutes and was still going; the job cap caught it, 25 minutes
+    # after a developer stopped learning anything. A stalled apt is almost
+    # always one unreachable mirror, and the second attempt picks a different
+    # one — so three bounded tries cost at most six minutes and usually one.
+    #
+    # `timeout` rather than a longer job cap: the useful signal is "this hung
+    # again", and it is only useful quickly.
+    - name: Install build deps
+      shell: bash
+      run: |
+        for attempt in 1 2 3; do
+          echo "::group::apt attempt $attempt"
+          if sudo timeout 120 apt-get install -y \
+              gcc-arm-none-eabi \
+              libnewlib-arm-none-eabi \
+              mtools; then
+            echo "::endgroup::"
+            exit 0
+          fi
+          echo "::endgroup::"
+          echo "attempt $attempt did not finish inside 120s"
+          # Only ahead of a *retry*, never on the first pass: refreshing the
+          # lists re-fetches a dozen third-party indexes this build has no use
+          # for, which is why the first attempt deliberately does not.
+          sudo timeout 120 apt-get update || true
+        done
+        echo "apt-get could not install the toolchain in three bounded attempts"
+        exit 1
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # Straight after checkout, because it is the cheapest step and the one a
+    # new file is most likely to fail (#198). Same shape as the config-artifact
+    # check below: the script a developer runs is the one that gates the build.
+    - name: Every source file states its licence
+      shell: bash
+      run: ./tools/check-licence-headers.sh
+
+    - name: Render webconfig
+      shell: bash
+      working-directory: webconfig
+      run: make
+    
+    - name: Build disk image
+      shell: bash
+      working-directory: disk
+      run: ./create.sh
+
+    # Before the firmware, so a logic regression fails fast and reads as a
+    # logic failure rather than as a build one. Needs no cross-compiler or
+    # SDK build; the #67 USB-boundary test uses bundled TinyUSB headers.
+    - name: Run host tests
+      shell: bash
+      run: |
+        cmake -S tests -B tests/build
+        cmake --build tests/build
+        ctest --test-dir tests/build --output-on-failure
+
+    # The vector file is generated, and nothing else notices if it is not. A
+    # hand-forged tag would otherwise pass the whole pipeline green, which is
+    # the one failure the generator exists to prevent. Same shape as the
+    # config-artifact check below: the script a developer runs is the one that
+    # gates the build.
+    - name: Golden vectors match their generator
+      shell: bash
+      run: |
+        python3 tools/gen-frame-vectors.py --self-test
+        python3 tools/gen-frame-vectors.py > /tmp/frames.txt
+        diff -u test-vectors/frames.txt /tmp/frames.txt
+        python3 tools/gen-frame-vectors.py --primitives > /tmp/primitives.txt
+        diff -u test-vectors/primitives.txt /tmp/primitives.txt
+
+    # The run sheet's timing reader (#39). It is awk, and the awk at the desk is
+    # BSD while the one here is not — a dialect difference is otherwise found
+    # halfway through a hardware sitting, which is the expensive place to find
+    # it. Same shape as "Golden vectors match their generator" above: the
+    # command a developer runs is the one that gates the build.
+    - name: The run sheet reads its own timings
+      shell: bash
+      run: ./tools/clipboard-run-sheet.sh selftest
+
+    - name: Build firmware
+      shell: bash
+      run: |
+        cmake -S . -B build
+        cmake --build build
+
+    # After the firmware, deliberately. The build renders the page and rebuilds
+    # the image itself, into the source tree — so running this earlier would
+    # check bytes the build then overwrites, and whatever the firmware actually
+    # embedded would go unchecked.
+    #
+    # The check lives in a script so the one a developer can run is the one that
+    # gates the build, rather than an approximation of it kept in step by hand.
+    - name: Committed page and image match their sources
+      shell: bash
+      run: ./tools/check-config-artifacts.sh
+
+    - name: Note where this runner's image differs
+      if: always()
+      continue-on-error: true
+      shell: bash
+      run: |
+        command -v mformat >/dev/null || { echo "no mtools — nothing to compare"; exit 0; }
+        [ -f disk/disk.img ] || { echo "no image built — nothing to compare"; exit 0; }
+        mformat --version | head -1
+        git show HEAD:disk/disk.img > /tmp/committed.img
+        python3 disk/imgdiff.py /tmp/committed.img disk/disk.img
+
+    - name: Publish artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: deskhop-gha-${{ github.run_number }}
+        path: build/deskhop.uf2
+
+  # The Windows helper (#49, ADR-0006). A separate job because it needs MSVC,
+  # and parallel with the other two because none of them depends on another's
+  # output.
+  #
+  # This job is what makes the no-install claim something a user *receives*
+  # rather than something we assert: the exe it publishes is the deliverable,
+  # built with the static CRT against inbox libraries only, and a change that
+  # quietly reintroduced a redistributable would fail here rather than on the
+  # managed laptop.
+  #
+  # It also runs the existing host suite under MSVC — a third reading of a core
+  # that gcc and clang have both already accepted. Warnings that reading raises
+  # are core defects to fix, not to suppress.
+  #
+  # And it is the only place the clipboard seal's cipher is exercised: CNG is
+  # Windows, so no other runner can check that *its* AES-256-GCM produces the
+  # bytes on the wire (#113).
+  windows-helper:
+    runs-on: windows-latest
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # Split from the build so a configure failure reads as one. No vcpkg, no
+    # conan, no toolchain file: a clean MSVC box builds the tree as checked out
+    # (ADR-0006), so there is nothing to install first.
+    - name: Configure the helper
+      shell: bash
+      run: cmake -S helpers/windows -B helpers/windows/build
+
+    - name: Build the helper
+      shell: bash
+      run: cmake --build helpers/windows/build --config Release
+
+    # The autostart ladder's decisions (#86), the clipboard path (#52), the
+    # shim's dispatch (#152), and the seal's cipher against the golden vectors
+    # (#113). The ladder is the logic most likely to be wrong on a managed
+    # laptop nobody can reproduce, and the dispatch is the layer a service can
+    # emit the right output into and have nothing happen — the Win32 calls
+    # behind both are not reached from here. The seal test is here because CNG
+    # is only here.
+    - name: Run the helper tests
+      shell: bash
+      run: ctest --test-dir helpers/windows/build -C Release --output-on-failure
+
+    # The core's own suite, compiled by MSVC. The runtime setting comes from
+    # tests/CMakeLists.txt rather than from a flag passed here, deliberately —
+    # see ADR-0006.
+    - name: Run the host suite under MSVC
+      shell: bash
+      run: |
+        cmake -S tests -B tests/build-msvc
+        cmake --build tests/build-msvc --config Release
+        ctest --test-dir tests/build-msvc -C Release --output-on-failure
+
+    - name: Publish the helper
+      uses: actions/upload-artifact@v4
+      with:
+        name: deskhop-helper-windows-${{ github.run_number }}
+        path: helpers/windows/build/Release/deskhop-helper.exe
+
+  # The macOS helper's own suite (#77). A separate job because it needs a
+  # macOS runner, and parallel with the firmware because neither depends on
+  # the other's output — so this costs no wall-clock time at all: 39s
+  # against the firmware job's 50s, measured on run 31560674857.
+  #
+  # Deliberately not filtered to changes under helpers/: DHCore compiles
+  # src/core in place, so a change to the shared core is exactly what can
+  # break the binding without touching a line of Swift — which is the seam
+  # this is here to watch. Minutes are free on a public repository, so the
+  # only argument for filtering does not apply.
+  helper:
+    runs-on: macos-latest
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # Split from the run so a compile failure reads as one, rather than as a
+    # test failure. swift run would build implicitly.
+    #
+    # Every product, not just channel-tests: this is the only thing that
+    # compiles deskhop-helper, whose IOKit transport no test reaches. Cheap
+    # despite that — ~11s cold on the runner, against ~85s on an older local
+    # machine, so this job finishes before the firmware one does.
+    - name: Build helper
+      shell: bash
+      run: swift build
+
+    # An executable target, not a .testTarget — see Package.swift. No Xcode
+    # test host, no xcodebuild, and the same shape as the C harness: a main,
+    # an assertion helper, and a non-zero exit.
+    - name: Run helper tests
+      shell: bash
+      run: swift run channel-tests
+
+    - name: Run menu and login registration tests
+      shell: bash
+      run: bash tools/macos-checks/menu-tests.sh
+
+    # build.sh's deploy report, against a fake launchctl (#192).
+    - name: Run build report tests
+      shell: bash
+      run: bash tools/macos-checks/build-report-tests.sh
+
+    # make-app-bundle.sh, against a stand-in binary (#206).
+    - name: Run app bundle tests
+      shell: bash
+      run: bash tools/macos-checks/app-bundle-tests.sh
+
+    # The release build, universal (#203; #197 decision 6). The owner's desk
+    # runs the x86_64 half daily and this runner tests only the arm64 half,
+    # so the lipo check is the one look the x86_64 slice gets before it ships.
+    #
+    # One build per architecture and a lipo, not `--arch arm64 --arch x86_64`:
+    # that form hands the build to Xcode's xcbuild, which a Command Line Tools
+    # install does not have — and that install is the one a developer has
+    # (Package.swift). This form works on both.
+    #
+    # Every run, not only a tag, so a change that breaks one slice fails on
+    # main rather than on release day.
+    - name: Build the release helper, universal
+      shell: bash
+      run: |
+        swift build -c release --product deskhop-helper --triple arm64-apple-macosx
+        swift build -c release --product deskhop-helper --triple x86_64-apple-macosx
+        lipo -create .build/arm64-apple-macosx/release/deskhop-helper \
+                     .build/x86_64-apple-macosx/release/deskhop-helper \
+             -output .build/deskhop-helper
+        lipo -info .build/deskhop-helper
+        lipo .build/deskhop-helper -verify_arch arm64 x86_64
+
+    # The .app around it, ad-hoc sealed, and the zip a user downloads (#206).
+    # Made here, on the one runner that has codesign, and zipped here because
+    # upload-artifact stores every file as 644: a zip made now keeps the
+    # execute bit through the artifact store, so the release job only moves it.
+    - name: Wrap the release helper in a .app and zip it
+      shell: bash
+      run: |
+        ./tools/make-app-bundle.sh .build/deskhop-helper .build/app
+        unzip -l .build/app/deskhopplus-helper-macos.zip
+
+    - name: Publish the helper
+      uses: actions/upload-artifact@v4
+      with:
+        name: deskhop-helper-macos-${{ github.run_number }}
+        path: .build/app/deskhopplus-helper-macos.zip
+
+  # The release (#203, #197). A pushed v* tag makes a GitHub release holding
+  # the three files the README names, with no hand step. A push to main runs
+  # the three build jobs as always and skips this one. No third-party action:
+  # gh is on the runner and the release is one command.
+  #
+  # The files are renamed here and only here (#197 decision 4). Build targets,
+  # build.sh, the plist and the helper READMEs keep deskhop-helper. The one
+  # exception is the Mac zip, which arrives already named: the .app inside it
+  # carries the release name from make-app-bundle.sh (#206).
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, windows-helper, helper]
+    runs-on: ubuntu-latest
+    # The one job that writes to the repository, so the one job with the
+    # permission. Every other job keeps the default token.
+    permissions:
+      contents: write
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # actions/checkout fetches a tag push as `+<commit>:refs/tags/<tag>`, which
+    # leaves the local tag lightweight, pointing at the commit — and then
+    # --notes-from-tag below reads the commit message, not the tag's
+    # (actions/checkout#290). Fetch the real tag object over it.
+    - name: Fetch the annotated tag
+      shell: bash
+      run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+
+    # First, before anything is downloaded. A tag that does not name the
+    # version in dh_version.h would ship files whose menus and printouts say
+    # a different number. The script is the one a developer can run.
+    - name: The tag names the version in dh_version.h
+      shell: bash
+      run: ./tools/check-release-tag.sh "$GITHUB_REF_NAME"
+
+    # All three, flattened into one directory: the artifact names carry the
+    # run number, the file names inside do not, and none of them collide.
+    - name: Download the three builds
+      uses: actions/download-artifact@v4
+      with:
+        pattern: deskhop-*
+        path: dist
+        merge-multiple: true
+
+    - name: Name the files as the README does
+      shell: bash
+      run: |
+        mkdir release
+        mv dist/deskhop.uf2 release/deskhopplus.uf2
+        mv dist/deskhop-helper.exe release/deskhopplus-helper-windows.exe
+        mv dist/deskhopplus-helper-macos.zip release/
+        ls -l release
+
+    # --verify-tag: the tag must already be on the remote, which pushing it
+    # guarantees. --notes-from-tag: the notes are the annotated tag's message,
+    # so they live in git (#197 decision 11). Published at once, not a draft:
+    # pushing the tag is the deliberate act (decision 13).
+    - name: Publish the release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag release/*

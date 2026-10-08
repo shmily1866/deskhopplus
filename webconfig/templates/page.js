@@ -1,0 +1,190 @@
+// Page glue for the settings window (#225): which section is shown, which
+// computer's rows are under the picture, the connection words, the unsaved
+// count and the refusal strip. Presentation only: no field is duplicated and
+// nothing here talks to the board.
+
+function showSection(id) {
+  document.querySelectorAll('section[data-section]').forEach(s => {s.hidden = s.dataset.section !== id;});
+  document.querySelectorAll('#sidebar button').forEach(b => {
+    if (b.dataset.section === id) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+  });
+}
+
+document.getElementById('sidebar').addEventListener('click', event => {
+  const button = event.target.closest('button[data-section]');
+  if (button) showSection(button.dataset.section);
+});
+
+// Click a computer in the picture and its rows appear under it, the way the
+// OS shows the settings of the monitor you click.
+function selectComputer(letter) {
+  document.getElementById('layout').dataset.selected = letter;
+  document.querySelectorAll('.computer[data-computer]').forEach(c => {c.hidden = c.dataset.computer !== letter;});
+  refreshTitles();
+}
+
+// "Output A · MacOS": the group title carries the OS the picture's label shows.
+function refreshTitles() {
+  document.querySelectorAll('[data-os-of]').forEach(span => {
+    const os = [...document.querySelectorAll(`.computer[data-computer="${span.dataset.osOf}"] .row`)]
+      .find(row => row.querySelector('label')?.textContent === 'Operating System')?.querySelector('select');
+    const name = os && os.selectedIndex > 0 ? os.options[os.selectedIndex].text : '';
+    span.textContent = name ? ' · ' + name : '';
+  });
+}
+
+for (const type of ['pointerdown', 'focusin', 'keydown'])
+  document.getElementById('layout').addEventListener(type, event => {
+    const computer = event.target.closest('[data-output]');
+    if (computer) selectComputer(computer.dataset.output);
+  });
+
+// Every gesture ends in a redraw of the picture, and a drop writes its fields
+// without an event, so the redraw is where the unsaved count follows a drop.
+// The same pass keeps a wide desk (up to seven monitors a side) readable: at
+// least 0.9px per picture unit, and the picture scrolls inside the well
+// instead of shrinking to a strip.
+new MutationObserver(() => {
+  const svg = document.querySelector('#layout svg');
+  if (svg) svg.style.minWidth = Math.round(svg.viewBox.baseVal.width * 0.9) + 'px';
+  refresh();
+}).observe(document.getElementById('layout'), {childList: true});
+
+// Connect flips every board-facing control on; the words in the toolbar say
+// so. The markup starts disabled, so nothing runs at load.
+const connected = () => document.getElementById('connection').dataset.on === '1';
+
+function setConnected(on) {
+  const words = document.getElementById('connection');
+  words.textContent = on ? 'Connected — config mode' : 'Not connected';
+  words.dataset.on = on ? '1' : '';
+  document.getElementById('fields').disabled = !on;
+  document.querySelectorAll('.online').forEach(b => {b.disabled = !on;});
+  // Off: the picture goes back to its connect text, so nothing can be dragged.
+  if (!on) redrawLayout();
+}
+
+// Unsaved: derived, never stored. A field is unsaved when its value differs
+// from what the last Read fetched. Save shows the count; a section with one
+// or more carries a dot.
+function unsavedFields() {
+  return [...document.querySelectorAll('.api, .hotkey-text, .keymap-text')].filter(f =>
+    !f.readOnly && f.type !== 'hidden' && f.hasAttribute('fetched-value') && f.getAttribute('fetched-value') != getValue(f));
+}
+
+function refreshUnsaved() {
+  const fields = unsavedFields();
+  const badge = document.getElementById('unsaved');
+  badge.textContent = fields.length;
+  badge.hidden = !fields.length;
+  const sections = new Set(fields.map(f => f.closest('section[data-section]').dataset.section));
+  document.querySelectorAll('#sidebar button').forEach(b => b.toggleAttribute('data-unsaved', sections.has(b.dataset.section)));
+}
+
+// Status LED: After means nothing while Turn off is Never (#283).
+function refreshStatusLed() {
+  const mode = document.querySelector('[data-key="101"]');
+  const after = document.querySelector('[data-key="102"]');
+  if (mode && after) after.disabled = !Number(mode.value);
+}
+
+// What every edit, report and toolbar action refreshes.
+function refresh() {
+  refreshUnsaved();
+  refreshTitles();
+  refreshStatusLed();
+}
+
+document.getElementById('main').addEventListener('input', event => {
+  if (event.target.getAttribute('aria-invalid')) {
+    event.target.removeAttribute('aria-invalid');
+    event.target.closest('.row').querySelector('small').textContent = '';
+  }
+  refresh();
+});
+document.getElementById('main').addEventListener('change', refresh);
+
+// Exit reboots the board, which drops the device: the toolbar says so. A
+// page that already reported why (an action threw first) keeps its reason.
+navigator.hid?.addEventListener('disconnect', event => {
+  if (event.device === device && connected()) setConnected(false);
+});
+
+// Toolbar actions run one at a time: the toolbar is disabled while one runs,
+// so a second click on Save cannot start a second Save loop. A refused Save
+// bands the top of the window with the fields that need a fix. An action that
+// throws means the board is gone or was never chosen: the page says so and
+// keeps the user's values for a later Read or Save.
+document.getElementById('menu-buttons').addEventListener('click', async event => {
+  const handler = event.target.closest('button')?.dataset.handler;
+  if (!handler) return;
+  const buttons = [...document.querySelectorAll('#menu-buttons button')];
+  buttons.forEach(b => {b.disabled = true;});
+  try {
+    const result = await window[handler]();
+    // Back to the rule, not to a snapshot: Connect may just have turned the page on.
+    buttons.forEach(b => {b.disabled = b.classList.contains('online') && !connected();});
+    if (handler === 'saveHandler') showRefusal(result === false);
+    // Read replaces the values the last Save refused, so its errors go too.
+    if (handler === 'readHandler') clearErrors();
+  } catch (error) {
+    console.error(error);
+    setConnected(false);
+    document.querySelector('[data-handler="connectHandler"]').disabled = false;
+    document.getElementById('connection').textContent = 'Not connected — ' + (error.message || error);
+  }
+  refresh();
+});
+
+function clearErrors() {
+  document.querySelectorAll('.hotkey-error, .keymap-error').forEach(e => {e.textContent = '';});
+  showRefusal(false);
+}
+
+function revealField(field) {
+  showSection(field.closest('section[data-section]').dataset.section);
+  const computer = field.closest('.computer[data-computer]');
+  if (computer) selectComputer(computer.dataset.computer);
+  const advanced = field.closest('details');
+  if (advanced) advanced.open = true;
+  field.scrollIntoView({block: 'center'});
+  field.focus();
+}
+
+function showRefusal(refused) {
+  const strip = document.getElementById('refusal');
+  const rows = refused ? [...document.querySelectorAll('.row')].filter(r => r.querySelector('small')?.textContent) : [];
+  const control = row => row.querySelector('input, textarea');
+  document.querySelectorAll('[aria-invalid]').forEach(f => f.removeAttribute('aria-invalid'));
+  rows.forEach(r => control(r).setAttribute('aria-invalid', 'true'));
+  strip.hidden = !rows.length;
+  if (!rows.length) return;
+  const name = row => {
+    const section = row.closest('section[data-section]').querySelector('h2').textContent;
+    const computer = row.closest('.computer[data-computer]');
+    return `${section} › ${computer ? 'Output ' + computer.dataset.computer + ' ' : ''}${row.querySelector('label').textContent}`;
+  };
+  const esc = text => text.replace(/[&<>]/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;'}[c]));
+  strip.lastElementChild.innerHTML = `<strong>Save refused.</strong> ${rows.length} field${rows.length > 1 ? 's need' : ' needs'} a fix; nothing was sent.<ul>` +
+    rows.map(row => `<li><a href="#">${esc(name(row))}</a>: ${esc(row.querySelector('small').textContent)}</li>`).join('') + '</ul>';
+  strip.querySelectorAll('a').forEach((a, i) => a.addEventListener('click', e => {e.preventDefault(); revealField(control(rows[i]));}));
+  revealField(control(rows[0]));
+}
+
+// Service: a button that wipes or reboots takes two clicks. The first arms it
+// and says so; the second acts; a click anywhere else disarms it.
+window.addEventListener('click', event => {
+  const armed = document.querySelector('#service-buttons button[data-armed]');
+  if (armed && !armed.contains(event.target)) {armed.textContent = armed.dataset.armed; delete armed.dataset.armed;}
+});
+document.getElementById('service-buttons').addEventListener('click', event => {
+  const button = event.target.closest('button[data-handler]');
+  if (!button) return;
+  if (button.dataset.arm && !button.dataset.armed) {
+    button.dataset.armed = button.textContent;
+    button.textContent = button.dataset.arm;
+    return;
+  }
+  if (button.dataset.armed) {button.textContent = button.dataset.armed; delete button.dataset.armed;}
+  window[button.dataset.handler]();
+});

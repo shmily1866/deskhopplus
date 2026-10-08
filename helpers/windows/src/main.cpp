@@ -1,0 +1,880 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
+/* Copyright (c) 2026 Derek Reynolds */
+
+/*
+ * The Windows helper: a single portable exe that finds the device, seizes
+ * every channel, introduces itself, keeps the session alive (#49), and carries
+ * the clipboard across it (#52).
+ *
+ * Clipboard text, images and files (#52, #55, #56); cursor placement is #53. Nothing needs installing: see helpers/windows/README.md
+ * and ADR-0006.
+ *
+ * ---------------------------------------------------------------------------
+ * THE LOOP, AND WHY IT IS ONE THREAD
+ *
+ * Device events arrive as WM_DEVICECHANGE on this window. Reports arrive as
+ * overlapped read completions. MsgWaitForMultipleObjectsEx waits on both at
+ * once, so they are handled in arrival order on the thread that owns the
+ * window — the same thread the tray and (later) clipboard ownership must run
+ * on anyway. The shared core assumes a single-threaded caller. There is
+ * nothing here to lock, and that is a decision rather than an accident.
+ *
+ * Nothing in this file decides anything about the session. Every decision is
+ * src/core/dh_helper.c, reached through HelperSession. This file carries
+ * messages and owns the clock. What each output *means* is output_dispatch.cpp,
+ * so that every arm of it is reachable by a test (#152); this file is the Win32
+ * half of that seam.
+ * ---------------------------------------------------------------------------
+ */
+
+#include <windows.h>
+
+#include <dbt.h>
+#include <shlobj.h>
+
+#include <share.h>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "autostart.h"
+#include "channel_identity.h"
+#include "clip_service.h"
+#include "clipboard.h"
+#include "cursor_placement.h"
+#include "debug_logging.h"
+#include "dh_p256.h"
+#include "file_store.h"
+#include "helper_session.h"
+#include "hid_transport.h"
+#include "output_dispatch.h"
+#include "seal_aead.h"
+#include "secret_store.h"
+#include "tray.h"
+
+namespace deskhop {
+
+namespace {
+
+constexpr wchar_t kWindowClass[] = L"deskhopplus_helper";
+/* One instance per user session. Two helpers would both try to seize the same
+   channel and the second would sit in "every channel refused" for ever, which
+   is a true report of a self-inflicted problem and a confusing one — the
+   likeliest way to reach it is autostart having already started one. */
+constexpr wchar_t kInstanceMutex[] = L"Local\\deskhopplus-helper";
+
+/* Fine enough that a heartbeat is never late by much, and the same figure the
+   macOS helper ticks at. ADR-0004's interval is a second; a quarter of it
+   leaves room for the wait to be woken by something else first. */
+constexpr uint32_t kTickMs = 250;
+/* One step of the Windows clock. The beat timer and GetTickCount64 both move
+   in steps of about 15.6 ms, so a beat can read as a step short of kTickMs;
+   without the slack the tick would skip it and run at half rate inside a
+   modal loop (#262). */
+constexpr uint32_t kTickSlackMs = 16;
+/* The timer that keeps the beat alive inside a modal message loop; see
+   WM_TIMER in Helper::handle (#161). */
+constexpr UINT_PTR kBeatTimerId = 1;
+
+/* How often to re-sweep while no channel has been found (#157). Long enough
+   that an absent device costs one SetupAPI enumeration a second and nothing
+   else — the sweep logs only when its answer changes — and short enough that
+   a sweep taken a few milliseconds into a reboot's device rebuild is
+   corrected before the user reaches for the tray. Nothing sweeps once a
+   channel is found. */
+constexpr uint32_t kRescanMs = 1000;
+
+std::string hex(const std::vector<uint8_t> &bytes) {
+    std::string out;
+    char pair[3];
+    for (uint8_t byte : bytes) {
+        std::snprintf(pair, sizeof pair, "%02x", byte);
+        out += pair;
+    }
+    return out;
+}
+
+} // namespace
+
+/*
+ * The shim. What each output *means* is output_dispatch.cpp's, which is where
+ * a test can watch it (#152); this class is the Win32 half of that seam — the
+ * tray, the transport, this computer's clipboard, the secret store and the
+ * clock — plus the run loop that carries messages between them.
+ */
+class Helper : public HelperEffects {
+  public:
+    bool start(HINSTANCE instance);
+    int run();
+    void stop() { PostQuitMessage(0); }
+
+    /* HelperEffects: one line each over the real object. Public because the
+       interface is, and for no other reason — nothing calls them but the
+       dispatch. */
+    bool store_board_key(const std::vector<uint8_t> &key) override {
+        return secrets_.save_board_key(key);
+    }
+    void acquire_channels() override { transport_.acquire(); }
+    void release_channels() override { transport_.release(); }
+    bool send(const std::vector<uint8_t> &frame) override {
+        return transport_.send(frame.data(), frame.size(),
+                               session_->have_negotiated() ? session_->negotiated().channel_count : 1);
+    }
+    bool build_frame(uint8_t type, const std::vector<uint8_t> &body,
+                     std::vector<uint8_t> &out) override {
+        return session_->emit(type, body, out);
+    }
+    void note_sent() override { session_->note_sent(now_ms()); }
+    void note_send_refused() override { session_->note_send_refused(); }
+    void show_state(dh_helper_state state) override {
+        tray_.show(words::presence_state(state, transport_.mode() == Mode::Config,
+                                         session_->can_send_bulk()));
+    }
+    void deliver_text(const std::vector<uint8_t> &utf8) override {
+        clipboard_.deliver_text(utf8);
+    }
+    void deliver_bundle(const std::vector<uint8_t> &utf8,
+                        const std::vector<uint8_t> &png) override {
+        clipboard_.deliver_bundle(utf8, png);
+    }
+    void deliver_image(const std::vector<uint8_t> &png) override {
+        if (waiting_for_image_) {
+            awaited_image_ = png;
+            return;
+        }
+        if (prefetched_image_id_ != 0) {
+            prefetched_image_id_ = 0;
+            clipboard_.deliver_image(png, prefetched_image_sequence_);
+            return;
+        }
+        clipboard_.deliver_image(png);
+    }
+    void lazy_image(uint32_t id, uint64_t total) override {
+        prefetched_image_id_ = id;
+        prefetched_image_sequence_ = GetClipboardSequenceNumber();
+        log("prefetching remote image " + std::to_string(id) + " of " +
+            std::to_string(total) + " bytes without claiming the Windows clipboard");
+        dispatch_.emit(clipboard_service_->request_lazy_image(id));
+    }
+    void cancel_lazy_image(uint32_t id) override {
+        if (prefetched_image_id_ == id) {
+            prefetched_image_id_ = 0;
+            return;
+        }
+        clipboard_.cancel_lazy_image(id);
+    }
+    void schedule_retry(uint32_t after_ms) override {
+        /* Compared as an unsigned difference in run(), never as `now >= then`:
+           the clock is 32-bit milliseconds and wraps, and a plain comparison
+           would fire every retry at once for the 24 days after it does. */
+        retry_pending_ = true;
+        retry_at_ = now_ms() + after_ms;
+    }
+    void ask_about_files(const deskhop::FileOffer &offer) override {
+        log(std::to_string(offer.files.size()) + " file(s), " + std::to_string(offer.total) +
+            " bytes, offered from the other computer; waiting for an answer here before "
+            "anything crosses");
+        tray_.ask_about_files(offer);
+    }
+
+    /* A balloon, which is where the user already looks for anything the
+       clipboard has to say. It names a remedy, which is the bar tray.h sets
+       for interrupting anyone. */
+    void tell_user(const std::string &message) override {
+        log(message);
+        tray_.balloon(message);
+    }
+    void tell_news(const std::string &message) override {
+        log(message);
+        tray_.balloon(message, false);
+    }
+    void show_peer(bool connected) override { tray_.show_peer(connected); }
+    void withdraw_file_question(uint32_t id) override { tray_.withdraw_file_question(id); }
+    /* Written first, then referenced. The order is the guarantee: a reference
+       only ever points at a set that is complete on disk, so a failed write
+       leaves the clipboard alone rather than pointing at half a file. */
+    void deliver_files(const FileDelivery &delivery) override {
+        FileStore::Written written;
+        if (!files_.write(delivery, written)) {
+            log(std::to_string(delivery.files.size()) +
+                " file(s) arrived and could not be written; nothing was put on the clipboard");
+            return;
+        }
+        if (clipboard_.deliver_files(written.paths))
+            log(std::to_string(written.paths.size()) +
+                " file(s) written and put on the clipboard");
+    }
+    std::vector<ClipOutput> clip_policy_changed(uint8_t flags, uint8_t cap_mb) override {
+        std::vector<ClipOutput> outputs = clipboard_service_->policy_changed(flags);
+        for (ClipOutput &item : clipboard_service_->capacity_changed(cap_mb))
+            outputs.push_back(std::move(item));
+        return outputs;
+    }
+    void log(const std::string &message) override;
+
+  private:
+    static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l);
+    LRESULT handle(UINT message, WPARAM w, LPARAM l);
+
+    void feed(const std::vector<Output> &outputs);
+    void tick(uint32_t now, bool nested);
+    std::optional<std::vector<uint8_t>> request_lazy_image(uint32_t id, uint64_t total);
+    void abandon_prefetched_image();
+
+    /*
+     * Monotonic, deliberately. A wall clock going backwards — routine on a
+     * laptop coming out of sleep — would stall the heartbeat past the device's
+     * absence deadline and kill a healthy session. The core compares its
+     * milliseconds as unsigned differences, so truncating to 32 bits here is
+     * arithmetic rather than a session dropped every 49 days.
+     */
+    uint32_t now_ms() const { return static_cast<uint32_t>(GetTickCount64()); }
+
+    Tray::Callbacks tray_callbacks();
+    std::wstring log_path() const { return secrets_.directory() + L"\\helper.log"; }
+    void open_log(const wchar_t *mode);
+    void set_debug_logging(bool on);
+
+    static Helper *instance_;
+
+    HWND window_{nullptr};
+    UINT taskbar_created_{0};
+    HANDLE single_instance_{nullptr};
+    /* Off by default (#271): off writes nothing and leaves helper.log alone. */
+    bool debug_logging_{false};
+    FILE *log_file_{nullptr};
+
+    SecretStore secrets_;
+    std::unique_ptr<HelperSession> session_;
+    std::unique_ptr<Autostart> autostart_;
+    std::unique_ptr<ClipService> clipboard_service_;
+    std::unique_ptr<CursorPlacement> cursor_placement_;
+    HidTransport transport_;
+    Tray tray_;
+    Clipboard clipboard_;
+    /* Where files that arrive are written, emptied at start (#56). */
+    FileStore files_;
+    OutputDispatch dispatch_{*this};
+
+    uint32_t last_tick_{0};
+    /* Set while the WM_TIMER beat runs its reads and tick; see WM_TIMER in
+       handle. */
+    bool in_beat_{false};
+    /* The message run() is dispatching, so that WM_TIMER can tell its own
+       loop from one nested inside a handler: a modal loop such as the tray
+       menu, or the image prefetch's wait. */
+    UINT dispatching_{0};
+    /* Set while tick() runs; see there. */
+    bool in_tick_{false};
+    /* The received percent last logged from a nested loop (#262). */
+    uint64_t nested_percent_logged_{UINT64_MAX};
+    uint32_t last_rescan_{0};
+    bool retry_pending_{false};
+    uint32_t retry_at_{0};
+    /*
+     * Whether the last thing the session said was that bulk may cross. The
+     * clipboard has to be told when a session *ends* — its seal and any
+     * transfer go with it — and the session reports a state rather than an
+     * event, so the transition is worked out here.
+     */
+    bool bulk_was_allowed_{false};
+    bool waiting_for_image_{false};
+    /* What the tray last showed, so the tick only touches it when the transfer
+       has actually moved. */
+    uint64_t shown_received_{0};
+    uint64_t shown_total_{0};
+    bool shown_sending_{false};
+    uint32_t prefetched_image_id_{0};
+    uint32_t prefetched_image_sequence_{0};
+    std::optional<std::vector<uint8_t>> awaited_image_;
+};
+
+Helper *Helper::instance_ = nullptr;
+
+void Helper::log(const std::string &message) {
+    /* A WIN32-subsystem process has no console, so the log is a file beside
+       the helper's other state plus the debugger's stream — both readable on
+       a machine where nothing may be installed to read them. */
+    if (!debug_logging_) return;
+    const std::string line = "[" + std::to_string(now_ms()) + "ms] " + message + "\n";
+    if (log_file_) {
+        std::fputs(line.c_str(), log_file_);
+        std::fflush(log_file_);
+    }
+    OutputDebugStringA(line.c_str());
+}
+
+void Helper::open_log(const wchar_t *mode) {
+    /*
+     * _wfsopen and not _wfopen_s: the secure variant opens a file
+     * non-shareable, which locked this log against every reader while the
+     * helper ran. Reading it is the documented way to tell a refused channel
+     * from a disconnected device (#114), so a log nobody can open until the
+     * helper is quit answers the question only after destroying its subject.
+     * _SH_DENYWR keeps this process the only writer and lets anything read.
+     */
+    log_file_ = _wfsopen(log_path().c_str(), mode, _SH_DENYWR);
+}
+
+/* The Debug logging tick. Takes effect at once: on opens helper.log for
+   append (no trim, that is a start-time rule), off closes it and keeps it. */
+void Helper::set_debug_logging(bool on) {
+    const bool saved = debug_logging::set(secrets_.directory(), on);
+    if (on) {
+        if (!log_file_) open_log(L"a");
+        debug_logging_ = true;
+    }
+    /* Written while the log is still open, so a failed untick is recorded
+       too: the next start would otherwise come back on with no reason given. */
+    if (!saved) log("could not save the Debug logging choice; it lasts until the helper quits");
+    if (!on) {
+        if (log_file_) std::fclose(log_file_);
+        log_file_ = nullptr;
+        debug_logging_ = false;
+    }
+}
+
+bool Helper::start(HINSTANCE instance) {
+    instance_ = this;
+
+    single_instance_ = CreateMutexW(nullptr, TRUE, kInstanceMutex);
+    if (!single_instance_ || GetLastError() == ERROR_ALREADY_EXISTS) return false;
+
+    SHCreateDirectoryExW(nullptr, secrets_.directory().c_str(), nullptr);
+    /* Read before the first log line, so every line obeys it. The log trim
+       runs here and only here: a file left on for days is emptied once it is
+       over 5 MB, and never while the helper runs. */
+    debug_logging_ = debug_logging::is_on(secrets_.directory());
+    std::error_code no_log;
+    const std::uintmax_t size = std::filesystem::file_size(log_path(), no_log);
+    switch (debug_logging::at_start(debug_logging_, no_log ? 0 : size)) {
+    case debug_logging::LogStart::DoNotOpen: break;
+    case debug_logging::LogStart::Empty: open_log(L"w"); break;
+    case debug_logging::LogStart::Append: open_log(L"a"); break;
+    }
+
+    /*
+     * Apartment-threaded, for the shell. The startup-folder rung of the
+     * autostart ladder writes its shortcut through IShellLink, and the tray
+     * lives on this thread — both want an STA, and initialising it once here
+     * beats each of them doing it and undoing it around every call.
+     */
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    WNDCLASSW window_class{};
+    window_class.lpfnWndProc = &Helper::window_proc;
+    window_class.hInstance = instance;
+    window_class.lpszClassName = kWindowClass;
+    if (!RegisterClassW(&window_class)) return false;
+
+    /*
+     * A top-level window that is never shown. There is no window worth
+     * showing: the helper's whole face is a notification-area icon. Until
+     * #208 this was a message-only window (HWND_MESSAGE), and that was the
+     * bug: a message-only window receives no broadcast at all, and
+     * TaskbarCreated — the message Explorer sends every top-level window when
+     * it restarts and has forgotten every tray icon — is a broadcast. So the
+     * re-add below never ran, and an Explorer restart left the helper running
+     * with no icon.
+     *
+     * Never shown, so it is in neither Alt-Tab nor the taskbar; the tool-window
+     * style makes that so even if something ever showed it. The broadcast
+     * WM_DEVICECHANGE now arrives as well as the registered ones; the
+     * transport keeps only arrivals and removals, and a rescan is cheap.
+     */
+    window_ = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, L"", WS_POPUP, 0, 0, 0, 0, nullptr,
+                              nullptr, instance, nullptr);
+    if (!window_) return false;
+
+    /* Explorer restarting takes every tray icon with it and then asks for them
+       back with this message. Without it the helper is invisible until it is
+       restarted. */
+    taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
+
+    SecretStore::Identity identity;
+    if (!secrets_.load_identity(identity)) {
+        log("could not load or create this helper's key; the system RNG refused");
+        return false;
+    }
+    /* The key id every hello carries, and the value the board's config page
+       shows as *Paired helper* (#114) — same spelling, so the two can be
+       compared by eye. */
+    log("helper key id: " + hex(identity.key_id));
+
+    /*
+     * Both halves of "am I paired?", said at startup rather than left to be
+     * inferred from what happens next. Without them a helper that pairs and is
+     * a stranger again after a restart looks like the board forgetting, and
+     * the sitting goes looking at the firmware.
+     */
+    if (!identity.persisted)
+        log("this key could not be written and exists only in memory; pairing will work now and "
+            "be gone after a restart, because the next start draws a different key");
+
+    std::vector<uint8_t> board_key = secrets_.load_board_key();
+    log(board_key.empty() ? "no stored board key: this helper must pair before it has a session"
+                          : "stored board key found: this helper has paired with a board before");
+
+    Identity core_identity;
+    core_identity.public_key = identity.public_key;
+    core_identity.key_id = identity.key_id;
+    /* The one ECDH the core asks a platform for. The HKDF over the result
+       stays in the core: a helper deriving its own session keys would be a
+       second implementation of the rule both ends must agree on. */
+    core_identity.ecdh = [private_key = identity.private_key](const uint8_t *peer,
+                                                             uint8_t *shared) {
+        return dh_p256_ecdh(private_key.data(), peer, shared);
+    };
+
+    session_ = std::make_unique<HelperSession>(
+        std::move(core_identity), std::move(board_key),
+        [](uint8_t *out, size_t len) {
+            /* A short draw would leave the core keying on bytes nobody chose.
+               There is nothing to fall back to, so this stops. */
+            if (!fill_random(out, len)) std::abort();
+        });
+
+    /*
+     * The clipboard. `seal_aead()` is null on a machine where CNG will not give
+     * up an AES-GCM provider — the service refuses every copy in that case
+     * rather than falling back to sending a payload in clear (ADR-0008).
+     */
+    if (seal_aead() == nullptr)
+        log("this machine has no AES-GCM provider; the clipboard cannot be sealed and so will "
+            "not be carried");
+    clipboard_service_ = std::make_unique<ClipService>(seal_aead(), [](uint8_t *out, size_t len) {
+        /* A short draw would key a seal on bytes nobody chose. There is
+           nothing to fall back to, so this stops. */
+        if (!fill_random(out, len)) std::abort();
+    });
+    cursor_placement_ = std::make_unique<CursorPlacement>(
+        [this](const std::string &message) { log(message); },
+        [this](uint8_t type, const std::vector<uint8_t> &body) {
+            if (dispatch_.send_payload(type, body, "a cursor-position response") &&
+                type == DH_MSG_POS_RESPONSE && !body.empty())
+                log("cursor response id=" + std::to_string(body[0]) + " sent");
+        });
+
+    /* Verified bulk frames, straight from the core. Nothing here re-reads the
+       stream: decode, tag and replay counter are all upstream of this. */
+    session_->set_payload_sink([this](uint8_t type, const uint8_t *body, size_t len) {
+        /* This computer just became the active output, by any route (#250). */
+        if (type == DH_MSG_ARRIVAL) {
+            log("arrival received");
+            dispatch_.emit(clipboard_service_->user_is_here());
+            return;
+        }
+        if (dispatch_.peer_status(type, body, len)) return;
+        if (cursor_placement_->received(type, body, len, now_ms())) {
+            /* The cursor has come here, so the user is here and a paste is
+               possible. Anything the clipboard was holding quietly is put to
+               them now (#56). */
+            dispatch_.emit(clipboard_service_->user_is_here());
+            return;
+        }
+        dispatch_.emit(clipboard_service_->received(type, body, len));
+    });
+
+    Clipboard::Callbacks clipboard_callbacks;
+    clipboard_callbacks.log = [this](const std::string &m) { log(m); };
+    /*
+     * Handed to the service whether or not a session exists to carry it. The
+     * service parks a copy until there is one, and gives up out loud after 30s.
+     *
+     * This used to be `if (!session_->can_send_bulk()) return;`, on the
+     * reasoning that a helper cannot both say "connected" and refuse a copy.
+     * True, and beside the point: on a link that is reconnecting the helper
+     * says "Reconnecting", and the user copies anyway because nobody reads the
+     * tray before pressing Ctrl-C. The copy was then dropped here with nothing
+     * written down, and the clipboard is read again only when something else is
+     * copied — so it was lost for good, silently.
+     */
+    clipboard_callbacks.local_copy = [this](std::vector<uint8_t> utf8) {
+        dispatch_.emit(clipboard_service_->local_copy(ClipKind::Text, utf8));
+    };
+    clipboard_callbacks.local_image = [this](std::vector<uint8_t> png) {
+        dispatch_.emit(clipboard_service_->local_copy(ClipKind::Png, png));
+    };
+    clipboard_callbacks.local_bundle = [this](std::vector<uint8_t> packed) {
+        dispatch_.emit(clipboard_service_->local_copy(ClipKind::Bundle, packed));
+    };
+    clipboard_callbacks.local_replaced = [this] { abandon_prefetched_image(); };
+    clipboard_callbacks.request_image = [this](uint32_t id, uint64_t total) {
+        return request_lazy_image(id, total);
+    };
+    clipboard_callbacks.lazy_image_replaced = [this](uint32_t id) {
+        dispatch_.emit(clipboard_service_->lazy_image_was_replaced(id));
+    };
+    clipboard_callbacks.local_files = [this](std::vector<FileEntry> files,
+                                             std::function<bool(std::vector<uint8_t> &)> read) {
+        /* The list goes out now; `read` is not called until the other
+           computer's user accepts the transfer. That is the whole of #56's
+           "transfer begins on paste, not on copy". */
+        dispatch_.emit(clipboard_service_->local_copy_files(files, std::move(read)));
+    };
+    clipboard_.attach(window_, std::move(clipboard_callbacks));
+
+    files_.log = [this](const std::string &m) { log(m); };
+    /* Emptied at start, and only at start: a helper that crashes never runs an
+       exit path, and a timer would delete a file the user is still working on
+       (file_store.h). */
+    files_.collect_garbage();
+
+    autostart_ = std::make_unique<Autostart>(secrets_.directory(),
+                                             [this](const std::string &m) { log(m); });
+    autostart_->start(Autostart::launched_by_autostart());
+
+    tray_.attach(window_, tray_callbacks());
+
+    HidTransport::Events events;
+    events.log = [this](const std::string &m) { log(m); };
+    events.device_appeared = [this](dh_device_identity which) {
+        feed(session_->device_appeared(which, now_ms()));
+    };
+    events.device_disappeared = [this] { feed(session_->device_disappeared(now_ms())); };
+    events.channels_acquired = [this](uint8_t count) {
+        feed(session_->channels_acquired(count, now_ms()));
+    };
+    events.acquisition_refused = [this](uint8_t acquired, uint8_t of) {
+        feed(session_->acquisition_refused(acquired, of, now_ms()));
+    };
+    events.received = [this](uint8_t channel, const uint8_t *data, size_t len) {
+        feed(session_->received(data, len, now_ms(), channel));
+    };
+    events.transport_failed = [this](const std::string &reason) {
+        feed(session_->transport_failed(reason, now_ms()));
+    };
+
+    last_tick_ = last_rescan_ = now_ms();
+    /* Runs for the life of the window, so that every modal loop is covered and
+       not just the tray menu (#161). */
+    SetTimer(window_, kBeatTimerId, kTickMs, nullptr);
+    log("deskhop helper started; waiting for the channel");
+    transport_.start(window_, std::move(events));
+    return true;
+}
+
+int Helper::run() {
+    for (;;) {
+        std::vector<HANDLE> handles = transport_.wait_handles();
+        const DWORD count = static_cast<DWORD>(handles.size());
+
+        const DWORD result = MsgWaitForMultipleObjectsEx(
+            count, count ? handles.data() : nullptr, kTickMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+
+        if (result == WAIT_OBJECT_0 + count) {
+            MSG message;
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT) {
+                    /* Destroying the clipboard-owner window gives Windows its
+                       WM_RENDERALLFORMATS chance before the channel stops. */
+                    if (window_ != nullptr) {
+                        DestroyWindow(window_);
+                        window_ = nullptr;
+                    }
+                    transport_.stop();
+                    clipboard_.detach();
+                    tray_.detach();
+                    return static_cast<int>(message.wParam);
+                }
+                TranslateMessage(&message);
+                dispatching_ = message.message;
+                DispatchMessageW(&message);
+                dispatching_ = 0;
+            }
+        }
+
+        /* Unconditional: a completion that arrived while the loop was in a
+           message handler is still sitting there, and its event was consumed
+           by whatever woke the wait. */
+        transport_.pump_reads();
+
+        const uint32_t now = now_ms();
+        if (retry_pending_ && now - retry_at_ < 0x80000000u) {
+            retry_pending_ = false;
+            /* Only when there is something to acquire and it is not already
+               held — the device may have come back on its own in the meantime. */
+            if (transport_.has_device() && !transport_.holding_channels()) transport_.acquire();
+        }
+        /* Unsigned difference, the same shape as the one in tick() and for the
+           same reason: GetTickCount64 is truncated to 32 bits here and wraps.
+           Guarded on has_device() — nothing found — rather than on
+           holding_channels(), so this can never race the retry above, which
+           runs only when there *is* something to acquire. */
+        if (!transport_.has_device() && now - last_rescan_ >= kRescanMs) {
+            last_rescan_ = now;
+            transport_.rescan();
+            /* Said out loud, because the sweep's own "channel(s) found" line
+               cannot say which caller asked for it, and that is exactly what
+               validating #157 needs to see: a recovery no device event could
+               have delivered. The guard above was false a line ago, so this
+               is only ever the rescan's own doing. */
+            if (transport_.has_device())
+                log("found by the idle rescan, with no device event to prompt it");
+        }
+        tick(now, false);
+    }
+}
+
+/*
+ * The periodic work, at most once per kTickMs. Called by run() and by the
+ * WM_TIMER beat, so a modal loop (the tray menu) does all of it too, not the
+ * heartbeat alone (#262).
+ */
+void Helper::tick(uint32_t now, bool nested) {
+    /* Not inside itself. Shell_NotifyIcon and the clipboard wait on other
+       processes, and Windows delivers sent messages meanwhile: a paste's
+       WM_RENDERFORMAT starts the image prefetch, whose wait pumps the beat
+       timer. A tick nested there would run on the outer one's half-done
+       state. */
+    if (in_tick_ || now - last_tick_ < kTickMs - kTickSlackMs) return;
+    in_tick_ = true;
+    last_tick_ = now;
+    feed(session_->tick(now));
+    /* A chance to push the next credit-gated batch. On the tick as well
+       as on arriving frames, so a transfer whose last credit grant was
+       lost still finishes rather than sitting still. */
+    if (session_->can_send_bulk()) dispatch_.emit(clipboard_service_->pump());
+    /* And a chance to give up on one that has stopped moving — the far
+       helper having crashed leaves this end's session perfectly
+       healthy, so nothing else here would ever notice. */
+    /* The board's drop totals go with the tick so that an
+       abandonment can quote them (#133). Read here rather than held
+       there: the board restates them whenever they move, and nothing
+       tells the clipboard when that was. */
+    dh_device_drops drops{};
+    const bool stated = session_->device_drops(&drops);
+    dispatch_.emit(clipboard_service_->tick(now, stated ? &drops : nullptr));
+
+    /* What the tray shows about the arriving transfer, refreshed only
+       when it has moved. It changes the icon and tooltip, not the menu, so
+       a menu the user has open stays open (#56, #262). */
+    uint64_t received = 0;
+    uint64_t total = 0;
+    if (!clipboard_service_->arriving(nullptr, &received, &total)) {
+        received = 0;
+        total = 0;
+    }
+    if (received != shown_received_ || total != shown_total_) {
+        shown_received_ = received;
+        shown_total_ = total;
+        tray_.show_progress(received, total);
+    }
+    /* Proof on hardware that a transfer moves under an open menu (#262). */
+    if (total == 0) {
+        nested_percent_logged_ = UINT64_MAX;
+    } else if (nested) {
+        const uint64_t percent = received * 100u / total;
+        if (percent != nested_percent_logged_) {
+            nested_percent_logged_ = percent;
+            log("in a nested message loop: received " + std::to_string(percent) + "%");
+        }
+    }
+    /* And the send, which the tooltip names (#208). */
+    const bool sending = clipboard_service_->awaiting_send();
+    if (sending != shown_sending_) {
+        shown_sending_ = sending;
+        tray_.show_sending(sending);
+    }
+    in_tick_ = false;
+}
+
+void Helper::feed(const std::vector<Output> &outputs) {
+    dispatch_.apply(outputs);
+
+    /*
+     * A session that has gone takes the seal and any transfer with it.
+     *
+     * Asked of `can_send_bulk` — the *session's* answer — and after every batch
+     * of outputs, not of the state the user is shown and not only when that
+     * state changes. `dh_helper_allows_bulk` counts RECONNECTING_REPEATEDLY as
+     * allowing bulk, and that is precisely the state a teardown lands in once
+     * the flap rate has tripped: the session is gone, its keys are cleared, and
+     * the state reads true before and after. Worse, the core reports that state
+     * only on the transition, so the second and subsequent drops of a burst
+     * produce no state output at all. #107 measured 586 teardowns in sixteen
+     * hours — the exact condition that trips the rate — so the edge that
+     * matters is the one this misses.
+     */
+    const bool live = session_->can_send_bulk();
+    if (bulk_was_allowed_ && !live) dispatch_.emit(clipboard_service_->session_ended());
+    if (const auto presence = words::session_edge_presence(session_->state(),
+                                                           transport_.mode() == Mode::Config,
+                                                           bulk_was_allowed_, live))
+        show_state(*presence);
+    bulk_was_allowed_ = live;
+}
+
+std::optional<std::vector<uint8_t>> Helper::request_lazy_image(uint32_t id, uint64_t total) {
+    awaited_image_.reset();
+    waiting_for_image_ = true;
+    dispatch_.emit(clipboard_service_->request_lazy_image(id));
+    const uint32_t started = now_ms();
+    const uint64_t estimated_ms = total * 1000u / (49u * 1024u);
+    const uint32_t timeout_ms = static_cast<uint32_t>(
+        std::min<uint64_t>(estimated_ms + 30000u, UINT32_MAX / 2u));
+    while (!awaited_image_ && session_->can_send_bulk() &&
+           now_ms() - started < timeout_ms) {
+        transport_.pump_reads();
+        feed(session_->tick(now_ms()));
+        if (session_->can_send_bulk()) dispatch_.emit(clipboard_service_->pump());
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) {
+                waiting_for_image_ = false;
+                PostQuitMessage(static_cast<int>(message.wParam));
+                return std::nullopt;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        Sleep(1);
+    }
+    waiting_for_image_ = false;
+    return std::exchange(awaited_image_, std::nullopt);
+}
+
+void Helper::abandon_prefetched_image() {
+    if (prefetched_image_id_ == 0) return;
+    const uint32_t id = std::exchange(prefetched_image_id_, 0);
+    dispatch_.emit(clipboard_service_->lazy_image_was_replaced(id));
+}
+
+Tray::Callbacks Helper::tray_callbacks() {
+    return Tray::Callbacks{
+        [this] { return autostart_->record().enabled; },
+        /* Opt-in, and opt back out. Never touched on first run: a portable exe
+           that silently writes a logon task is a surprise nobody asked for. */
+        [this] {
+            if (autostart_->record().enabled) autostart_->disable();
+            else autostart_->enable();
+        },
+        [this] {
+            if (MessageBoxW(window_, L"剪贴板同步和设备连接都会停止，直到下次启动。",
+                            L"退出 DeskHopPlus Helper？",
+                            MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                stop();
+            }
+        },
+        [this](uint32_t id) { dispatch_.emit(clipboard_service_->accept_files(id)); },
+        [this](uint32_t id) { dispatch_.emit(clipboard_service_->decline_files(id)); },
+        [this] { dispatch_.emit(clipboard_service_->abort_receive()); },
+        [this] { return clipboard_service_->awaiting_send(); },
+        [this] { dispatch_.emit(clipboard_service_->abort_send()); },
+        [this](const std::string &m) { log(m); },
+        [this] { return debug_logging_; },
+        [this] { set_debug_logging(!debug_logging_); },
+    };
+}
+
+LRESULT Helper::handle(UINT message, WPARAM w, LPARAM l) {
+    if (message == taskbar_created_ && taskbar_created_ != 0) {
+        /* The shell forgot every icon. Re-assert whatever the current state
+           says should be showing. */
+        tray_.detach();
+        tray_.attach(window_, tray_callbacks());
+        show_state(session_->state());
+        return 0;
+    }
+
+    switch (message) {
+    case WM_TIMER:
+        /*
+         * The heartbeat, kept going while something else owns this thread.
+         *
+         * `TrackPopupMenu` runs its own message loop and does not return until
+         * the user picks or dismisses, so the loop in `run()` — and with it the
+         * beat ADR-0004 owes the board — stopped for as long as the tray menu
+         * was open. The board evicts a helper it has not heard from for three
+         * seconds, so opening the menu to accept a file was the thing that
+         * killed the transfer (#161).
+         *
+         * A timer on this window is dispatched by a modal loop as well as by
+         * ours, so this covers every one of them rather than the menu alone.
+         * It runs the whole tick, not the beat alone: a transfer should not
+         * stall or freeze its percent because the menu is open (#262). The
+         * tray's fast menu timer shares this handler, for the reads.
+         */
+        if (w == kBeatTimerId || w == Tray::kMenuReadTimerId) {
+            /* Reads as well as the beat. A helper that sends while a menu is
+               open but never *reads* sees nothing from the board and drops the
+               session itself ("nothing from the device in 3.0s") — the same
+               eviction from the other end. Re-entrancy guarded because the
+               image prefetch pumps messages while it waits. The tray's fast
+               timer lands here too while its menu is open, for the reads;
+               tick() keeps its own 250 ms pace. */
+            if (in_beat_) return 0;
+            in_beat_ = true;
+            transport_.pump_reads();
+            tick(now_ms(), dispatching_ != WM_TIMER);
+            in_beat_ = false;
+            return 0;
+        }
+        if (w == Tray::kPromoteTimerId) {
+            tray_.on_timer();
+            return 0;
+        }
+        break;
+    case WM_DEVICECHANGE:
+        /*
+         * Any device event re-sweeps, and re-sweeping is also how a refusal
+         * recovers. The program that holds the channel *releasing* its handle
+         * produces no device notification at all, which is why the capped
+         * backoff runs beside this rather than instead of it: passive waiting
+         * would be waiting for ever.
+         */
+        transport_.on_device_change(w, l);
+        return TRUE;
+
+    case WM_CLIPBOARDUPDATE:
+        /* Something was copied on this computer. Handled on this thread
+           because setting clipboard data requires owning a window, and this is
+           the window (clipboard.h). */
+        clipboard_.handle(message, w);
+        return 0;
+
+    case WM_RENDERFORMAT:
+    case WM_RENDERALLFORMATS:
+    case WM_DESTROYCLIPBOARD:
+        /* Delayed image rendering and ownership loss are directed to the
+           owner window, not delivered as clipboard-update notifications. */
+        clipboard_.handle(message, w);
+        return 0;
+
+    case Tray::kCallbackMessage:
+        tray_.on_callback(l);
+        return 0;
+
+    case WM_CLOSE:
+    case WM_ENDSESSION:
+        stop();
+        return 0;
+
+    case WM_DESTROY:
+        stop();
+        return 0;
+
+    default:
+        break;
+    }
+    return DefWindowProcW(window_, message, w, l);
+}
+
+LRESULT CALLBACK Helper::window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
+    if (instance_ && instance_->window_ == window) return instance_->handle(message, w, l);
+    return DefWindowProcW(window, message, w, l);
+}
+
+} // namespace deskhop
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
+    deskhop::Helper helper;
+    if (!helper.start(instance)) return 1;
+    return helper.run();
+}

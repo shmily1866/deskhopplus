@@ -1,0 +1,816 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
+/* Copyright (c) 2026 Derek Reynolds */
+
+/*
+ * deskhopplus shared core — the *helper's* side of the session (#79, #80).
+ *
+ * The board's side is dh_session.h. This is the other end of the same
+ * conversation: the hello exchange, negotiation, ADR-0004's liveness, the
+ * pairing exchange, all-or-nothing acquisition, the capped reconnection
+ * backoff, and the states a user is shown.
+ *
+ * It existed in exactly one place before this file — SessionEngine.swift, 503
+ * lines only macOS can run — and #49 needs the same machine on Windows.
+ * Writing it a second time in C++ would give ADR-0004's traffic-gated
+ * liveness two implementations to get right, failing differently on two
+ * operating systems under load, in a way that looks like a hardware fault.
+ * So it is written once, here, and each helper is a transport and a face.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT IS HERE AND WHAT IS NOT
+ *
+ * **Here:** every decision. The state values, both policy predicates, the
+ * timings, the backoff, the negotiation, and the frames that go out.
+ *
+ * `dh_helper_prompts_pair_chord` is the one that is not a presentation
+ * choice. The chord provisions whatever is attached to the channel during its
+ * window (#34), so a state that offers it while something else holds the
+ * channel hands that something else the pairing. It is decided once, not per
+ * platform.
+ *
+ * **Not here:** the wording. A Windows tray tooltip and a macOS menu bar item
+ * are not one string table living in C — every output carries a code and its
+ * numbers, and each helper says it in its own words. That is also why this
+ * file needs no stdio.
+ *
+ * Also not here: secret *storage*. The decision to store a board key is an
+ * output (DH_HELPER_OUT_STORE_BOARD_KEY); whether it lands in DPAPI or a 0600
+ * file is the platform's business.
+ * ---------------------------------------------------------------------------
+ *
+ * Pure C11: no I/O, no allocation, no clock and no entropy source of its own —
+ * time arrives as a millisecond argument and entropy through a callback, so
+ * liveness is tested by driving ticks rather than by sleeping.
+ */
+
+#ifndef DH_HELPER_H_
+#define DH_HELPER_H_
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "dh_auth.h"
+#include "dh_frame.h"
+#include "dh_p256.h"
+#include "dh_session.h"
+
+/* C++ links these symbols too — the Windows helper is C++ (#49). */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ------------------------------------------------------------------ timings */
+
+/*
+ * All milliseconds, all compared with unsigned differences, so a wrapping
+ * counter is arithmetic rather than a session dropped once every 49 days.
+ *
+ * The two that are protocol, not policy, come from dh_session.h and are not
+ * restated: DH_SESSION_HEARTBEAT_MS is how long a direction may stay idle
+ * before this end fills it, and DH_SESSION_ABSENT_MS is how long the board may
+ * stay silent before this end gives up on the session.
+ */
+
+/*
+ * How long an unusable device is given before the user is told. A device that
+ * disappears for a moment is ordinary USB noise; one that is still gone five
+ * seconds later is worth reporting.
+ */
+/* How often the board's inbound chain is sampled, and the shortest window a
+   sample may be quoted over — see DH_NOTE_BOARD_HEARD_BYTES (#161). */
+#define DH_HELPER_CHAIN_SAMPLE_MS 1000u
+#define DH_HELPER_CHAIN_MIN_MS 500u
+#define DH_HELPER_SILENCE_MS 5000u
+
+/* A hello with no answer is a dead session, not a slow one. */
+#define DH_HELPER_HELLO_TIMEOUT_MS 2000u
+
+/*
+ * The reconnection *rate*, which is what says the thing no single cycle can.
+ * A helper failing every frame it received once spent two days reporting
+ * "Connected and paired" because each cycle on its own was correctly too brief
+ * to mention (#94).
+ */
+#define DH_HELPER_RECONNECT_WINDOW_MS 30000u
+#define DH_HELPER_RECONNECT_LIMIT 4u
+
+/*
+ * The second reading of the same fault, over a window three orders of
+ * magnitude longer, counting only sessions lost with the board still attached.
+ *
+ * The window above answers a link that is flapping *fast*. It cannot answer a
+ * slow loop, and a slow loop is what #107 measured: 586 teardowns in sixteen
+ * hours, one every 98 s, and later the same shape on Windows at one every
+ * ~195 s and on macOS at one every ~17 minutes. Four of those never land
+ * inside thirty seconds, so the state line read "Connected and paired" for the
+ * whole sixteen hours while the session was rebuilt underneath it.
+ *
+ * Widening the window above was not the fix. It counts every teardown,
+ * disappearances included, so a window long enough to reach 17-minute spacing
+ * would also call four ordinary unplugs across an afternoon a flapping link.
+ * This one counts only the teardowns *this end* decided on with the device
+ * still there — a liveness timeout, a protocol error, a failed write — and is
+ * cleared whenever the device goes away, so nothing innocent accumulates in it
+ * and the window can be as long as the fault is slow.
+ *
+ * Three inside three quarters of an hour: the slowest spacing observed puts
+ * three of them in ~34 minutes, and three sessions dying over a link that
+ * never moved has no benign reading.
+ *
+ * It takes only teardowns spaced further apart than the whole short window, so
+ * a burst contributes one entry and never three, and the two readings answer
+ * one fault each instead of the fast one latching the slow one for the rest of
+ * the hour. See `stands_alone` for what that costs and why the alternatives
+ * are worse. Sessions the board ends on purpose — a wipe, a mode change — are
+ * left out (#274). A loop slow enough to reach this reading does hold it up for as
+ * long as the window, which is the price of measuring something slow and the
+ * same property the short window has at its own scale.
+ */
+#define DH_HELPER_SESSION_LOSS_WINDOW_MS 2700000u
+#define DH_HELPER_SESSION_LOSS_LIMIT 3u
+
+/*
+ * How close two drops must be to be the same drop. A platform raises one
+ * device notification per HID interface, so a single disappearance arrives
+ * several times: returning from config mode, board B re-enumerated four times
+ * inside 187 ms and spent three of the four drops above on one event (#126).
+ *
+ * Chosen well clear of that burst and well under any interval a link could
+ * flap at and still be rebuilding a session in between — the rate has to keep
+ * catching what #94 cost two days.
+ */
+#define DH_HELPER_DROP_DEBOUNCE_MS 500u
+
+/* How often an unpaired helper asks again. The board ignores it outside a
+   pairing window, so the cost of asking is one untagged frame. */
+#define DH_HELPER_PAIRING_RETRY_MS 2000u
+
+/*
+ * Reconnection delay: doubling, capped. The cap is what matters — a config
+ * mode round trip can take five minutes, and a helper that had backed off to
+ * minutes would leave the user staring at a dead menu bar long after the
+ * device came back.
+ */
+#define DH_HELPER_BACKOFF_FIRST_MS 250u
+#define DH_HELPER_BACKOFF_CAP_MS 4000u
+
+/* ------------------------------------------------------------------- states */
+
+/*
+ * What the user is told, named with its remedy (#38). The wording lives in
+ * each helper; only the distinctions live here.
+ *
+ * `channelHeld` — "another program holds the channel" — used to be one of
+ * these and is gone (#72, #114, ADR-0008). It asserted something that can
+ * never be true on macOS: a second seizing open succeeds, measured on
+ * 2026-08-13, so the open is never refused for the reason the message named.
+ * What replaced it is DH_HELPER_LISTENER_DETECTED, which is measured rather
+ * than assumed — the board counts frames it could not authenticate and says
+ * so.
+ */
+typedef enum {
+    /* Looking, or briefly gone. Nothing is shown: a device that disappears for
+       a moment is ordinary, and config mode is something the user did. */
+    DH_HELPER_QUIET = 0,
+    DH_HELPER_CONNECTED = 1,
+    /* The connection keeps having to be rebuilt. See the reconnect window. */
+    DH_HELPER_RECONNECTING_REPEATEDLY = 2,
+    DH_HELPER_NOT_PAIRED = 3,
+    DH_HELPER_DEVICE_IN_CONFIG_MODE = 4,
+    DH_HELPER_DEVICE_ABSENT = 5,
+    DH_HELPER_VERSION_INCOMPATIBLE = 6,
+    /*
+     * Something other than this helper is writing frames the board could not
+     * authenticate, at a rate the board measured and reported (#111). It says
+     * only that: a listener that merely *reads* writes nothing to refuse and
+     * cannot be detected at all, so silence here is not a clean channel.
+     */
+    DH_HELPER_LISTENER_DETECTED = 7,
+    /*
+     * The board granted a pairing under a different identity key from the one
+     * this helper pinned — a board wiped past its identity sector, re-flashed,
+     * or swapped (#112).
+     */
+    DH_HELPER_BOARD_IDENTITY_CHANGED = 8,
+    DH_HELPER_CONNECTED_CONFIG_MODE = 9,
+
+    /*
+     * A bound, not a state: never passed to anything that takes a
+     * dh_helper_state. It exists so a binding can enumerate this enum and
+     * prove it carries every value — the macOS helper pairs `HelperState` with
+     * these by raw value, and without a count on this side a state added here
+     * would fall through to `.quiet` and be shown to nobody (#119).
+     *
+     * Keep it last, and keep the values above contiguous from 0 — this is a
+     * count, not a maximum. A state retired the way `channelHeld` was (#114)
+     * must be renumbered out rather than left as a gap, even though those raw
+     * values are the contract the bindings pin against.
+     */
+    DH_HELPER_STATE_COUNT
+} dh_helper_state;
+
+/*
+ * The chord remedy, offered from exactly one state.
+ *
+ * The two states a chord press would make *worse* are the reason this is a
+ * function and not a reading of the enum: DH_HELPER_LISTENER_DETECTED, where
+ * something else is writing to the channel and the chord would provision it,
+ * and DH_HELPER_BOARD_IDENTITY_CHANGED, where pressing it is the act that
+ * accepts a swapped board.
+ */
+static inline bool dh_helper_prompts_pair_chord(dh_helper_state s) {
+    return s == DH_HELPER_NOT_PAIRED;
+}
+
+/*
+ * An incompatible peer keeps cursor placement and refuses bulk: a misparsed
+ * placement puts the cursor somewhere wrong and self-corrects, while a
+ * misparsed chunk header writes a corrupted file presented as valid.
+ *
+ * A connection that keeps being rebuilt is not one of those — while it is up
+ * it is a negotiated session like any other. Nor is a detected listener: the
+ * session is authenticated, and what the board saw is somebody *writing*
+ * frames the tag already keeps out. What a listener can still do is *read* a
+ * payload in clear, and the remedy for that is sealing it (#113), not
+ * withholding it on a signal a passive listener never trips.
+ *
+ * This must keep agreeing with dh_helper_can_send_bulk, the seam #52 consumes.
+ */
+static inline bool dh_helper_allows_bulk(dh_helper_state s) {
+    return s == DH_HELPER_CONNECTED || s == DH_HELPER_CONNECTED_CONFIG_MODE ||
+           s == DH_HELPER_RECONNECTING_REPEATEDLY ||
+           s == DH_HELPER_LISTENER_DETECTED;
+}
+
+/* ------------------------------------------------------------------ outputs */
+
+typedef enum {
+    /*
+     * The board's public key, out of a PAIR_GRANT this helper asked for.
+     * Storing it is the platform's job; the machine only decides it is worth
+     * keeping — and never emits one for a board whose key has changed.
+     */
+    DH_HELPER_OUT_STORE_BOARD_KEY = 0,
+    DH_HELPER_OUT_OPEN_CHANNELS = 1,
+    DH_HELPER_OUT_CLOSE_CHANNELS = 2,
+    DH_HELPER_OUT_SEND = 3,
+    DH_HELPER_OUT_STATE = 4,
+    DH_HELPER_OUT_RETRY = 5, /* `a` is the delay in milliseconds */
+    DH_HELPER_OUT_NOTE = 6,  /* diagnostics, never shown to the user */
+    /*
+     * The board's clipboard policy (#52); `a` is the DH_CLIP_MAY_* flags and
+     * `b` is the size cap in megabytes (#56), already resolved so it is never
+     * zero. Emitted whenever the board states one, which is at least once per
+     * session and again on any change — so a platform that only ever reads
+     * this output is never working from a stale toggle or a stale cap.
+     */
+    DH_HELPER_OUT_CLIP_POLICY = 7,
+} dh_helper_output_kind;
+
+/*
+ * Diagnostic codes. Their wording belongs to each helper; what they must not
+ * lose is the number beside them — a note that says a rate without saying the
+ * rate is the mistake #94 cost two days to.
+ *
+ * `a` and `b` carry those numbers, documented per code.
+ */
+typedef enum {
+    DH_NOTE_NONE = 0,
+    /* a = frame type */
+    DH_NOTE_IGNORED_OUTSIDE_SESSION = 1,
+    /* a = frame type. A listener can provoke a genuine refusal, but it carries
+       the listener's correlation value and this is where it stops. */
+    DH_NOTE_IGNORED_WRONG_CORRELATION = 2,
+    DH_NOTE_UNDECODABLE = 3,          /* a = frame type */
+    DH_NOTE_HELLO_ENCODE_FAILED = 4,  /* a = dh_frame_result */
+    DH_NOTE_ASKING_TO_BE_PAIRED = 5,
+    DH_NOTE_PARTIAL_ACQUISITION = 6,  /* a = acquired, b = of */
+    DH_NOTE_EVERY_CHANNEL_REFUSED = 7,
+    DH_NOTE_PROTOCOL_ERROR = 8,       /* a = dh_frame_result */
+    DH_NOTE_NO_SESSION_KEY = 9,       /* a = frame type */
+    DH_NOTE_TAG_FAILED = 10,          /* a = frame type */
+    DH_NOTE_COUNTER_REPLAYED = 11,    /* a = frame type */
+    DH_NOTE_FRAME_DROPPED = 12,       /* a = frame type, b = dh_auth_result */
+    DH_NOTE_NO_BOARD_KEY = 13,
+    DH_NOTE_NO_STORED_NONCE = 14,
+    DH_NOTE_ACK_TOO_SHORT = 15,
+    DH_NOTE_KEY_DERIVATION_FAILED = 16,
+    DH_NOTE_DEVELOPMENT_BUILD = 17,   /* channel authentication is compiled out */
+    DH_NOTE_VERSION_MISMATCH = 18,    /* a = the board's version, b = this helper's */
+    DH_NOTE_BOARD_IDENTITY_CHANGED = 19,
+    DH_NOTE_PAIRED_BY_DEVICE = 20,
+    DH_NOTE_PAIR_REFUSED = 21,        /* a = dh_pair_refused_reason */
+    DH_NOTE_FIRST_BEAT = 22,
+    DH_NOTE_BEAT_RESUMED = 23,        /* a = ms since the last beat */
+    DH_NOTE_BEAT_QUIET = 24,          /* a = ms since the last beat */
+    DH_NOTE_SESSION_ENDED = 25,       /* a = dh_session_end_reason,
+                                         b = frames this helper got out over the
+                                             eviction window it was judged on */
+    DH_NOTE_LISTENER_DETECTED = 26,   /* a = refused frames, b = window ms */
+    DH_NOTE_NO_ACK = 27,              /* a = ms waited */
+    DH_NOTE_DEVICE_SILENT = 28,       /* a = ms of silence */
+    DH_NOTE_TRANSPORT_FAILED = 29,
+    DH_NOTE_RECONNECTION_RATE = 30,   /* a = drops counted, b = ms they spanned */
+    DH_NOTE_CLIP_POLICY = 31,         /* a = DH_CLIP_MAY_* flags, b = size cap in MB */
+    /*
+     * This end's side of the inbound chain, reported beside every session end
+     * so it can be read against the board's own totals in one place (#107).
+     * a = frames the transport took since boot, b = frames it refused.
+     */
+    DH_NOTE_LOCAL_SENDS = 32,
+    /*
+     * The board's own totals at the eviction, said by the core because no
+     * platform can read them by then (#107).
+     *
+     * drop_connection calls forget_session, which clears the cached totals —
+     * correctly, since they belong to the board that session was with (#133).
+     * Three attempts to log them from the platform side printed nothing for
+     * exactly that reason. a = frames the board took and authenticated,
+     * b = reports its USB callback delivered.
+     */
+    DH_NOTE_BOARD_AT_END = 33,
+    /*
+     * How long the board says it heard nothing, from the liveness end itself
+     * (#107). The board is the only end that can state this, and it is the
+     * whole of what such an end asserts — a helper whose own counters say it
+     * was talking across the eviction cannot otherwise tell a real silence
+     * from a deadline that fired against a refreshed clock. a = ms.
+     */
+    DH_NOTE_BOARD_SILENT_FOR = 34,
+    /*
+     * What the board's *inbound* chain lost, said on every teardown (#161).
+     *
+     * DH_NOTE_BOARD_AT_END next door reports what the board took; this reports
+     * what it could not take, and the two are only useful together. An
+     * eviction where the board says it heard nothing while this end has frames
+     * out over the window is either a report the board dropped — which costs
+     * the frame riding it, and ended the session outright until ADR-0012 —
+     * or something else entirely, and until now no log could tell them apart:
+     * the drop totals were printed only by a stalled *transfer*, which an
+     * eviction is not.
+     *
+     * a = inbound reports the board's USB callback could not hand on,
+     * b = frames from the peer board core 0 had not drained.
+     */
+    DH_NOTE_BOARD_LOST_AT_END = 37,
+    /*
+     * How much arrived over USB while the board was hearing nothing (#161).
+     *
+     * A liveness end asserts "no frame of yours completed here". This says
+     * whether the *bytes* were arriving anyway, which is the whole of what is
+     * left to decide, and it needs nothing new on the wire: reports_in already
+     * rides the drop report, so this is a reading the helper has held all
+     * along and never printed.
+     *
+     *   a = 0  -> nothing reached the board's USB callback at all, so the
+     *             frames never left this machine however the transport
+     *             reported them
+     *   a > 0  -> bytes arrived and no frame came out of them, so the board's
+     *             frame reader is sitting on a partial frame
+     *
+     * frames_in is deliberately *not* reported beside it. A liveness end is
+     * only reachable while that counter is still, so quoting it would dress an
+     * invariant up as a measurement. b = the window the count covers, in ms.
+     */
+    DH_NOTE_BOARD_HEARD_BYTES = 38,
+    /*
+     * What the board got out to this helper, said on every teardown (#143).
+     *
+     * The mirror of DH_NOTE_BOARD_AT_END, which reads the *inbound* chain from
+     * the board's own totals. Outbound had no counter anywhere: everything a
+     * seam could count was clean while large transfers still failed, and the
+     * one thing on that path nobody counted was the frames themselves. So a
+     * lost report showed up only as the tag failure of the frame it truncated,
+     * two events after the fact.
+     *
+     * Read off the authentication counter, which already carried it: the board
+     * spends one counter per frame it builds, so the highest that arrives says
+     * how many it built and the tally says how many got here. a = frames the
+     * board built, b = frames that never arrived.
+     *
+     * `b` is not all transport loss. A frame the board's own outbound queue
+     * refused was tagged and never sent, and from this end looks the same —
+     * which is why the board publishes its refusal totals (#142) and why the
+     * two are read together: b minus those is what the wire lost.
+     */
+    DH_NOTE_BOARD_SENDS = 35,
+    /*
+     * A report went missing between the board and here, and the reader
+     * bridged the gap (#143, ADR-0012). a = the reader's resync count this
+     * session: reports and partial frames it threw away to get back to a
+     * frame start, not gaps. One lost report from the middle of a frame
+     * counts one; the lost head of a 66-report chunk counts 65, one per
+     * orphaned continuation, each said on the report that arrived.
+     *
+     * Counted, never acted on: the frame that lost a report is discarded
+     * before it is judged, so the receiver sees the same gap a refused
+     * outbound frame leaves (ADR-0005) and recovers the way it already does.
+     * DH_NOTE_BOARD_SENDS cannot say it — a discarded frame's counter is
+     * never recorded, so that run reads as one frame short, the same as a
+     * refusal.
+     */
+    DH_NOTE_STREAM_MISALIGNED = 36,
+    /*
+     * A CLIP_CHUNK failed its tag and the connection was kept (#63).
+     *
+     * Every other frame type still drops the connection on a bad tag
+     * (DH_NOTE_TAG_FAILED) — this is the one deliberate exception, not a
+     * relaxation of that rule. A CLIP_CHUNK carries nothing but ciphertext
+     * payload: whether the corruption is a hostile frame or a flaky USB link
+     * (a dock was the one measured, #63), it can never be decrypted or acted
+     * on without this exact tag passing, so tolerating it costs nothing #34's
+     * isolation guarantee cares about — only *how loudly* the same undecodable
+     * bytes are reacted to. dh_xfer's own recovery (dh_xfer_sweep_rx) is what
+     * asks for it again; this note is otherwise a no-op, same as
+     * DH_NOTE_FRAME_DROPPED. a = frame type (always DH_MSG_CLIP_CHUNK).
+     */
+    DH_NOTE_CHUNK_TAG_TOLERATED = 39,
+} dh_helper_note;
+
+/*
+ * The largest frame this machine emits: a PAIR_REQUEST, which is a 4-byte
+ * header and a 72-byte body with no authentication prefix. Stated because it
+ * sizes the output slot — under v1 a pair frame was 20 bytes, and a buffer
+ * built on that number would silently stop this helper ever asking to be
+ * paired (the shape of the defect #109 found on the board's reply buffer).
+ */
+#define DH_HELPER_FRAME_MAX (DH_FRAME_HEADER_SIZE + DH_PAIR_REQUEST_LEN)
+
+typedef struct {
+    uint8_t kind;  /* dh_helper_output_kind */
+    uint8_t state; /* dh_helper_state, for DH_HELPER_OUT_STATE */
+    uint8_t note;  /* dh_helper_note, for DH_HELPER_OUT_NOTE */
+    /* Signed because some of them are result codes, which are negative. */
+    int32_t a;
+    int32_t b;
+    /* DH_HELPER_OUT_SEND: a complete frame. DH_HELPER_OUT_STORE_BOARD_KEY:
+       the board's 64-byte public key. Otherwise empty. */
+    uint8_t bytes[DH_HELPER_FRAME_MAX];
+    size_t len;
+} dh_helper_output;
+
+/*
+ * Enough for any single input. The worst case is one received report holding
+ * two frames whose handling both drops the connection; `overflow` counts what
+ * would not fit rather than letting a dropped `send` pass for nothing having
+ * happened.
+ */
+#define DH_HELPER_OUTPUTS_MAX 16u
+
+typedef struct {
+    size_t count;
+    size_t overflow;
+    dh_helper_output items[DH_HELPER_OUTPUTS_MAX];
+} dh_helper_outputs;
+
+void dh_helper_outputs_reset(dh_helper_outputs *o);
+
+/* ----------------------------------------------------------------- identity */
+
+/*
+ * This helper's key pair, abstracted because the private half may be
+ * unreachable: on macOS it lives in the Secure Enclave and cannot be handed to
+ * C at all. What the enclave *can* do is one ECDH, so that is the whole seam.
+ *
+ * The HKDF over the result stays in the core (dh_auth.h). A helper deriving
+ * its own session keys would be a second implementation of the rule both ends
+ * must agree on, which is what this file exists to prevent.
+ */
+typedef struct {
+    void *ctx; /* handed back to every callback; may be NULL */
+    uint8_t public_key[DH_P256_PUBLIC_SIZE];
+    uint8_t key_id[DH_KEY_ID_SIZE];
+
+    /* Who this helper is running as, reported in every hello: dh_os, and
+       dh_build_type for the helper's own build. Neither is derivable here —
+       the whole point of this file is that it does not know its platform. */
+    uint8_t os;
+    uint8_t build_type;
+
+    /* ECDH(this helper's private half, board_public) -> shared_secret.
+       False when the board's key is not a point on the curve. */
+    bool (*ecdh)(void *ctx, const uint8_t board_public[DH_P256_PUBLIC_SIZE],
+                 uint8_t shared_secret[DH_P256_SHARED_SIZE]);
+
+    /* Unpredictable bytes: nonces and correlation values. A core with no
+       entropy source of its own asks for them, the same reasoning that makes
+       dh_session stage its nonce. */
+    void (*entropy)(void *ctx, uint8_t *out, size_t len);
+} dh_helper_identity;
+
+/* --------------------------------------------------------------- the machine */
+
+typedef enum {
+    /* Normal mode. The channel exists only here. */
+    DH_DEVICE_NORMAL = 0,
+    /*
+     * Config mode reboots the device with a different interface set for up to
+     * five minutes. Seeing it tells the helper exactly what happened, which is
+     * why it is a state of its own and not "the device is gone".
+     */
+    DH_DEVICE_CONFIG_MODE = 1,
+} dh_device_identity;
+
+typedef struct {
+    uint8_t channel_count;
+    uint16_t max_chunk;
+    uint8_t device_build; /* dh_build_type */
+} dh_helper_negotiated;
+
+typedef enum {
+    DH_HELPER_PHASE_IDLE = 0,
+    DH_HELPER_PHASE_AWAITING_ACK = 1,
+    DH_HELPER_PHASE_LIVE = 2,
+} dh_helper_phase;
+
+/*
+ * A frame this machine authenticated but does not decide about — a bulk
+ * clipboard message, a cursor placement — handed to the platform as a verified
+ * body (#52).
+ *
+ * A callback rather than an output because of size: an output slot is 76 bytes
+ * and a sealed clipboard chunk is over a thousand, so carrying one through
+ * `dh_helper_outputs` would grow every slot by the largest payload on the
+ * wire. `body` views the reader's buffer and is valid only for the duration of
+ * the call.
+ *
+ * Everything upstream of this has already happened: the frame was decoded, its
+ * tag verified under the session key, and its counter checked against replay.
+ * What reaches a sink is a frame the registered board sent.
+ */
+typedef void (*dh_helper_payload_fn)(void *ctx, uint8_t type, const uint8_t *body, size_t len);
+
+typedef struct {
+    const dh_helper_identity *identity;
+
+    /* Read these; do not write them. */
+    dh_helper_state state;
+    dh_helper_negotiated negotiated;
+    bool have_negotiated;
+
+    /*
+     * The board's clipboard direction policy (#52), and whether it has said
+     * one this session. Until it has, both directions are allowed — the stored
+     * default — so a helper never refuses a copy because a frame is still in
+     * flight.
+     */
+    uint8_t clip_flags;
+    /* The size cap the board stated, already resolved through dh_clip_cap_mb —
+       so it is a number to act on, never zero, even before the board has said
+       anything (#56). */
+    uint8_t clip_cap_mb;
+    bool have_clip_policy;
+
+    /*
+     * What the board says it has dropped on the channel, and whether it has
+     * said anything this session (#133). Read live, while the fault is
+     * happening — which is the whole point: the config page could only ever
+     * report these on a board that had just rebooted and zeroed them.
+     *
+     * Forgotten with the session, so a stall never quotes totals from the
+     * board this helper was talking to before.
+     */
+    dh_device_drops device_drops;
+    bool have_device_drops;
+    /* The inbound chain as it read a moment ago, so a teardown can quote what
+       changed rather than a total since the board booted (#161). */
+    uint32_t chain_reports_in;
+    uint32_t chain_at_ms;
+    bool have_chain;
+
+    dh_helper_payload_fn payload_fn;
+    void *payload_ctx;
+
+    uint8_t phase; /* dh_helper_phase */
+    dh_frame_reader reader;
+    dh_frame_reader extra_reader[DH_SESSION_CHANNEL_COUNT - 1];
+    uint8_t acquired_channels;
+
+    uint32_t backoff_ms;
+    uint32_t hello_sent_at;
+    uint32_t last_sent_at;
+    /*
+     * Frames this helper got out, over the window the board judges it on
+     * (#107). Two buckets rather than a ring of timestamps: under load there
+     * are thousands of them and the question — was this end talking while the
+     * board heard nothing — needs an order of magnitude, not a history.
+     * Rolling one into the other keeps the reported total covering at least a
+     * full DH_SESSION_ABSENT_MS, so it can never read low merely because a
+     * window had just restarted.
+     */
+    uint32_t sends_this_window;
+    uint32_t sends_last_window;
+    uint32_t send_window_started_at;
+    /* Since boot, so this end's totals can be set against the board's own
+       without waiting for another round of rebuilding (#107). */
+    uint32_t sends_total;
+    uint32_t sends_refused;
+    uint32_t last_device_frame_at;
+    uint32_t last_device_beat_at;
+    bool have_device_beat;
+    bool beat_quiet_noted;
+    bool holding_channels;
+    bool config_mode;
+
+    /* The last few drops, oldest first — a rate, not an event. */
+    uint32_t recent_drops[DH_HELPER_RECONNECT_LIMIT];
+    size_t drop_count;
+
+    /* The same, over the long window, holding only sessions lost while the
+       board stayed attached. Cleared whenever the device goes away. */
+    uint32_t recent_session_losses[DH_HELPER_SESSION_LOSS_LIMIT];
+    size_t session_loss_count;
+
+    /* When the device last changed identity (normal <-> config mode). The
+       channel set is still settling for a moment after, and a teardown then
+       is the reboot, not the link (#274). */
+    uint32_t identity_changed_at;
+    bool identity_changed;
+
+    /* A state worth reporting only if it is still true when the window ends.
+       `deferred_at` is when it was armed, not when it comes due: a deadline
+       stored as a sum cannot be compared wrap-safely against the clock. */
+    bool have_deferred;
+    dh_helper_state deferred_state;
+    uint32_t deferred_at;
+
+    uint32_t pairing_requested_at;
+    bool pairing_requested;
+
+    /* The last hello timed out with the board answering nothing. It is what
+       separates a handshake that cannot complete — which a pairing window can
+       fix — from a session that completes and then dies, which one cannot. */
+    bool hello_went_unanswered;
+
+    uint32_t started_at;
+    bool started;
+    bool ever_saw_device;
+    dh_device_identity last_device_identity;
+
+    /*
+     * The board's identity key, pinned at pairing. Deliberately **not**
+     * dropped when the board says it does not know us: it is the only record
+     * of which board this helper trusts, and a control a restart clears is not
+     * a control. A stale pin costs nothing — the board checks its registration
+     * before it checks the tag, so the hello is still refused with `unpaired` —
+     * and keeping it is what lets a grant carrying a *different* key be
+     * recognised as a different board (#112).
+     *
+     * Only the user clears it.
+     */
+    uint8_t board_public_key[DH_P256_PUBLIC_SIZE];
+    bool have_board_key;
+
+    /* The board's last listener alert, and the window it was measured over.
+       The alert is a rate, so it expires like one; leaving the warning up for
+       the rest of the session would make it a latch rather than a reading
+       (#94). */
+    uint32_t listener_alert_at;
+    uint32_t listener_alert_window_ms;
+    bool listener_alert_live;
+
+    /* Per session, cleared together. */
+    uint8_t helper_nonce[DH_NONCE_SIZE];
+    bool have_nonce;
+    uint64_t hello_correlation;
+    uint64_t pair_correlation;
+    uint8_t k_h2b[DH_SESSION_KEY_SIZE];
+    uint8_t k_b2h[DH_SESSION_KEY_SIZE];
+    bool have_keys;
+    uint64_t tx_counter;
+    dh_auth_counter rx;
+} dh_helper;
+
+/*
+ * `board_public_key` is what the platform had stored, or NULL for a helper
+ * that has never paired. `identity` must outlive the machine.
+ */
+void dh_helper_init(dh_helper *h, const dh_helper_identity *identity,
+                    const uint8_t *board_public_key);
+
+/* Whether a bulk transfer may go out right now — the seam #52 consumes. It
+   answers for the *session*, where dh_helper_allows_bulk answers for what the
+   user is being told; the two must not disagree. */
+static inline bool dh_helper_can_send_bulk(const dh_helper *h) {
+    return h->phase == DH_HELPER_PHASE_LIVE && h->have_negotiated;
+}
+
+/*
+ * Where verified bulk and placement frames go. Set once, before the first
+ * input; passing NULL drops them, which is what a helper with no payloads yet
+ * does.
+ */
+void dh_helper_set_payload_sink(dh_helper *h, dh_helper_payload_fn fn, void *ctx);
+
+/* What the board last said about the clipboard's two directions (#52). Both
+   allowed until it has said anything, which is what the toggles default to. */
+static inline uint8_t dh_helper_clip_flags(const dh_helper *h) { return h->clip_flags; }
+
+/* The clipboard size cap the board last stated, in megabytes (#56). Never
+   zero: a helper that has been told nothing uses the default, which is what
+   the stored setting means. */
+static inline uint8_t dh_helper_clip_cap_mb(const dh_helper *h) {
+    return dh_clip_cap_mb(h->clip_cap_mb);
+}
+
+/*
+ * The board's drop totals, if it has stated any this session (#133). False
+ * means it has not — which is not the same answer as all-zero, and a caller
+ * that conflates them is back to reading silence as evidence.
+ */
+bool dh_helper_device_drops(const dh_helper *h, dh_device_drops *out);
+static inline bool dh_helper_may_send_clip(const dh_helper *h) {
+    return (h->clip_flags & DH_CLIP_MAY_SEND) != 0;
+}
+static inline bool dh_helper_may_receive_clip(const dh_helper *h) {
+    return (h->clip_flags & DH_CLIP_MAY_RECEIVE) != 0;
+}
+
+/*
+ * The inputs. Every one takes the current time in milliseconds and appends to
+ * `out`, which the caller resets (or not, to batch a sequence).
+ */
+void dh_helper_device_appeared(dh_helper *h, dh_device_identity which, uint32_t now_ms,
+                               dh_helper_outputs *out);
+void dh_helper_device_disappeared(dh_helper *h, uint32_t now_ms, dh_helper_outputs *out);
+
+/* Every channel was opened exclusively. A partial acquisition is not this
+   input — it is dh_helper_acquisition_refused. */
+void dh_helper_channels_acquired(dh_helper *h, uint8_t count, uint32_t now_ms,
+                                 dh_helper_outputs *out);
+void dh_helper_acquisition_refused(dh_helper *h, uint8_t acquired, uint8_t of, uint32_t now_ms,
+                                   dh_helper_outputs *out);
+
+/* One 64-byte report off the channel, byte 0 its frame-start flag
+   (ADR-0012). One report per call, never a concatenation. */
+void dh_helper_received_channel(dh_helper *h, uint8_t channel, const uint8_t *data, size_t len,
+                                 uint32_t now_ms, dh_helper_outputs *o);
+void dh_helper_received(dh_helper *h, const uint8_t *data, size_t len, uint32_t now_ms,
+                        dh_helper_outputs *out);
+
+/*
+ * The transport could not carry something it was given. A refused write is a
+ * handle that can no longer be trusted — the device has stopped draining or
+ * gone — so this is a dropped connection, not a retryable write. (The frame
+ * itself is only lost: the device's reader discards a half-frame on the next
+ * frame's flag, ADR-0012.)
+ */
+void dh_helper_transport_failed(dh_helper *h, uint32_t now_ms, dh_helper_outputs *out);
+
+/*
+ * Build one authenticated frame to send to the board — a bulk chunk, a cursor
+ * placement — under the session key and the next counter in its space.
+ *
+ * The counter space belongs to the key (dh_auth.h), and the heartbeat is
+ * already writing into this one. A platform keeping a counter of its own
+ * beside it would give one space two writers, and the board refuses anything
+ * not strictly greater — so whichever frame lost the race would be dropped
+ * silently, at the far end, with nothing at either end able to say why. The
+ * allocation lives here for that reason and not for tidiness.
+ *
+ * `out` is the caller's, because a bulk chunk is far larger than anything this
+ * machine emits on its own.
+ *
+ * DH_FRAME_ERR_UNKNOWN_TYPE when there is no session: no keys, so nothing can
+ * be tagged, and no negotiated session to carry it. Mirrors
+ * dh_session_emit_relayed at the other end.
+ *
+ * The idle timer is **not** charged here. A frame the transport then refused
+ * would have suppressed a beat that was owed; call dh_helper_note_sent when it
+ * actually went out.
+ */
+dh_frame_result dh_helper_emit(dh_helper *h, uint8_t type, uint8_t flags, const uint8_t *body,
+                               size_t body_len, uint8_t *out, size_t cap, size_t *out_len);
+
+/*
+ * A frame this helper actually got out, whoever produced it — a bulk chunk, a
+ * cursor placement, or the beat this machine built a moment ago. ADR-0004's
+ * heartbeat fills a direction that has carried *nothing* for a full interval,
+ * so anything that did carry has to say so.
+ *
+ * **This is the only thing that charges the idle timer for a beat**, and the
+ * platform calls it once the transport has taken the frame — never before.
+ * dh_helper_tick charging at build time is what #107 was: a beat the transport
+ * refused bought a full interval of silence it had not earned, and the board
+ * evicts after three of them. A platform that never calls this beats on every
+ * tick, which is the safe direction to fail in.
+ *
+ * The hello and the pair request are the exception and still charge when they
+ * are built: each has its own timeout and re-sends itself, where the beat has
+ * nothing behind it.
+ */
+void dh_helper_note_sent(dh_helper *h, uint32_t now_ms);
+
+/* The mirror of the above: the transport would not take the frame. Counted so
+   a helper that is writing and a helper that is being refused are different
+   readings rather than the same silence (#107). */
+void dh_helper_note_send_refused(dh_helper *h);
+
+void dh_helper_tick(dh_helper *h, uint32_t now_ms, dh_helper_outputs *out);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* DH_HELPER_H_ */
