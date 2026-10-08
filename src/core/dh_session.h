@@ -78,7 +78,7 @@ extern "C" {
  * the byte as a malformed PEER_PAIRED. See docs/protocol.md, "v6 is v5 with
  * PEER_HELPER". tools/gen-frame-vectors.py mirrors it.
  */
-#define DH_PROTO_VERSION 6u
+#define DH_PROTO_VERSION 7u
 
 /*
  * Two channels (#63, ADR-0002): the count is negotiated in the hello
